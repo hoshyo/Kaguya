@@ -1,0 +1,314 @@
+<script setup lang="ts">
+import { ref, computed, onMounted, onUnmounted, watch } from "vue";
+import { RouterView, RouterLink, useRouter, useRoute, type RouteLocationNormalized } from "vue-router";
+import { getStatus, getUpdateCheck, getToken, type Status, type UpdateInfo, clearToken } from "./api";
+
+const status = ref<Status | null>(null);
+const updateInfo = ref<UpdateInfo | null>(null);
+const navOpen = ref(false);
+let timer: number | undefined;
+const router = useRouter();
+const route = useRoute();
+const isLogin = computed(() => isPublicRoute(route));
+
+function isPublicRoute(route: RouteLocationNormalized): boolean {
+  return route.name === "login";
+}
+
+async function refreshStatus() {
+  if (!getToken() || isPublicRoute(router.currentRoute.value)) {
+    status.value = null;
+    return;
+  }
+  try {
+    status.value = await getStatus();
+  } catch {
+    status.value = null;
+  }
+}
+
+async function checkUpdate() {
+  if (!getToken() || isPublicRoute(router.currentRoute.value)) return;
+  try {
+    const info = await getUpdateCheck();
+    if (info.has_update) {
+      updateInfo.value = info;
+    }
+  } catch {
+    // silently ignore
+  }
+}
+
+function startPolling() {
+  stopPolling();
+  timer = window.setInterval(refreshStatus, 5000);
+}
+
+function stopPolling() {
+  if (timer) {
+    clearInterval(timer);
+    timer = undefined;
+  }
+}
+
+function logout() {
+  clearToken();
+  router.push("/login");
+}
+
+onMounted(() => {
+  refreshStatus();
+  checkUpdate();
+  startPolling();
+});
+onUnmounted(() => {
+  stopPolling();
+});
+
+// Stop polling on the login page (no token → 401 audit spam); resume once
+// the user navigates to an authenticated route with a token present.
+watch(
+  () => router.currentRoute.value.name,
+  () => {
+    navOpen.value = false;
+    const onLogin = isPublicRoute(router.currentRoute.value);
+    if (onLogin || !getToken()) {
+      stopPolling();
+      status.value = null;
+    } else if (!timer) {
+      refreshStatus();
+      startPolling();
+    }
+  },
+);
+</script>
+
+<template>
+  <div class="app">
+    <header class="topbar">
+      <div class="topbar-left">
+        <h1>
+          <span class="title-full">Hermes OneBot Adapter</span>
+          <span class="title-short">OneBot Adapter</span>
+        </h1>
+        <span v-if="status" class="version-tag">v{{ status.adapter_version }}</span>
+        <a
+          v-if="updateInfo?.has_update"
+          class="update-badge"
+          :href="updateInfo.changelog_url"
+          target="_blank"
+          rel="noopener"
+          :title="`有新版本 v${updateInfo.latest_version}，点击查看更新日志`"
+        >
+          v{{ updateInfo.latest_version }} →
+        </a>
+      </div>
+      <button
+        v-if="!isLogin"
+        class="nav-toggle"
+        type="button"
+        :aria-expanded="navOpen"
+        aria-controls="app-nav"
+        :aria-label="navOpen ? '关闭菜单' : '打开菜单'"
+        @click="navOpen = !navOpen"
+      >
+        <span class="nav-toggle-bars" :class="{ open: navOpen }" />
+      </button>
+      <nav v-if="!isLogin" id="app-nav" :class="{ open: navOpen }">
+        <RouterLink to="/" @click="navOpen = false">仪表盘</RouterLink>
+        <RouterLink to="/connections" @click="navOpen = false">连接管理</RouterLink>
+        <RouterLink to="/chat" @click="navOpen = false">聊天配置</RouterLink>
+        <RouterLink to="/commands" @click="navOpen = false">指令过滤</RouterLink>
+        <RouterLink to="/tools" @click="navOpen = false">工具管理</RouterLink>
+        <RouterLink to="/onebot-tools" @click="navOpen = false">OneBot 工具</RouterLink>
+        <RouterLink to="/advanced" @click="navOpen = false">高级设置</RouterLink>
+        <RouterLink to="/logs" @click="navOpen = false">日志</RouterLink>
+      </nav>
+      <div v-if="!isLogin" class="status-badges">
+        <span
+          v-if="status"
+          :class="['badge', status.onebot_connected ? 'badge-ok' : 'badge-err']"
+        >
+          {{ status.onebot_connected ? '●' : '○' }} OneBot
+        </span>
+        <span
+          v-if="status"
+          :class="['badge', status.hermes_plugin_connected ? 'badge-ok' : 'badge-err']"
+        >
+          {{ status.hermes_plugin_connected ? '●' : '○' }} 插件
+        </span>
+        <span v-if="!status" class="badge badge-err">● 离线</span>
+        <button class="logout-btn" @click="logout" title="退出登录">退出</button>
+      </div>
+    </header>
+    <main class="content">
+      <RouterView />
+    </main>
+  </div>
+</template>
+
+<style>
+:root {
+  --primary: #4a90e2;
+  --primary-dark: #357abd;
+  --success: #28a745;
+  --danger: #dc3545;
+  --warning: #ffc107;
+  --bg: #f5f6fa;
+  --card-bg: #fff;
+  --border: #e0e0e0;
+  --text: #222;
+  --text-muted: #666;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, -apple-system, sans-serif; color: var(--text); background: var(--bg); }
+
+.app { min-height: 100vh; display: flex; flex-direction: column; }
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.75rem 1.5rem;
+  background: var(--card-bg);
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+  flex-wrap: wrap;
+}
+.topbar-left { display: flex; align-items: center; gap: 0.5rem; min-width: 0; flex: 1 1 auto; }
+.logo { font-size: 1.3rem; }
+.topbar h1 { font-size: 1.1rem; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.title-short { display: none; }
+.nav-toggle { display: none; }
+.topbar nav { display: flex; gap: 0.5rem; flex: 1; flex-wrap: wrap; }
+.topbar nav a {
+  color: var(--text-muted);
+  text-decoration: none;
+  padding: 0.35rem 0.75rem;
+  border-radius: 4px;
+  transition: all 0.15s;
+  font-size: 0.95rem;
+}
+.topbar nav a:hover { background: var(--bg); color: var(--text); }
+.topbar nav a.router-link-active { color: var(--primary); font-weight: 600; background: rgba(74,144,226,0.08); }
+
+.status-badges { display: flex; gap: 0.5rem; }
+.badge {
+  font-size: 0.8rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: 12px;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.badge-ok { background: rgba(40,167,69,0.12); color: var(--success); }
+.badge-err { background: rgba(220,53,69,0.12); color: var(--danger); }
+.logout-btn {
+  font-size: 0.8rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.logout-btn:hover { color: var(--danger); border-color: var(--danger); }
+
+.version-tag {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.15rem 0.4rem;
+  font-family: monospace;
+}
+
+.update-badge {
+  font-size: 0.75rem;
+  color: #d97706;
+  background: rgba(245,158,11,0.12);
+  border: 1px solid rgba(245,158,11,0.3);
+  border-radius: 4px;
+  padding: 0.15rem 0.4rem;
+  font-family: monospace;
+  text-decoration: none;
+  transition: background 0.15s;
+}
+.update-badge:hover {
+  background: rgba(245,158,11,0.22);
+}
+
+.content { padding: 1.5rem; max-width: 1000px; width: 100%; margin: 0 auto; flex: 1; }
+
+/* Shared primary save button — used by all page-level save buttons.
+   Non-page-level buttons (modal save, change token) use different classes
+   to avoid inheriting these styles. */
+.save-btn {
+  background: var(--primary);
+  color: white;
+  border: none;
+  padding: 0.6rem 1.5rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.95rem;
+  transition: background 0.2s;
+}
+.save-btn:hover:not(:disabled) { background: var(--primary-dark); }
+.save-btn:disabled { background: #ccc; cursor: not-allowed; }
+
+@media (max-width: 768px) {
+  .topbar { gap: 0.5rem; padding: 0.5rem 1rem; }
+  .topbar h1 { font-size: 0.95rem; max-width: 100%; }
+  .title-full { display: none; }
+  .title-short { display: inline; }
+  .topbar-left { flex-wrap: wrap; }
+  .nav-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2.5rem;
+    height: 2.5rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .nav-toggle-bars,
+  .nav-toggle-bars::before,
+  .nav-toggle-bars::after {
+    display: block;
+    width: 1.1rem;
+    height: 2px;
+    background: var(--text);
+    border-radius: 1px;
+    position: relative;
+  }
+  .nav-toggle-bars::before,
+  .nav-toggle-bars::after {
+    content: "";
+    position: absolute;
+    left: 0;
+  }
+  .nav-toggle-bars::before { top: -6px; }
+  .nav-toggle-bars::after { top: 6px; }
+  .topbar nav {
+    display: none;
+    flex: 1 1 100%;
+    flex-direction: column;
+    gap: 0.15rem;
+    order: 4;
+  }
+  .topbar nav.open { display: flex; }
+  .topbar nav a { padding: 0.65rem 0.75rem; font-size: 0.95rem; }
+  .status-badges { flex: 1 1 100%; flex-wrap: wrap; justify-content: flex-start; }
+  .version-tag, .update-badge {
+    max-width: 8.5rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .content { padding: 1rem; }
+}
+</style>

@@ -1,0 +1,24 @@
+{
+  "format": 1,
+  "tested_platform": "Ubuntu 24.04 LTS (x86_64 or aarch64)",
+  "python": ">=3.11,<3.15",
+  "hermes": {
+    "repository": "https://github.com/NousResearch/hermes-agent.git",
+    "commit": "bf0203a794a07aac3ff764972ab9087baa4e4f4e",
+    "installer_url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/bf0203a794a07aac3ff764972ab9087baa4e4f4e/scripts/install.sh",
+    "installer_sha256": "99cb3691d55019c6973a7acb775a915648666cc24e483ca827a1cdbb3531a674"
+  },
+  "napcat_installer": {
+    "repository": "https://github.com/NapNeko/NapCat-Installer.git",
+    "commit": "aa5a6c7e27d943c20ef140cea5b0065a509cb9fc",
+    "installer_url": "https://raw.githubusercontent.com/NapNeko/NapCat-Installer/aa5a6c7e27d943c20ef140cea5b0065a509cb9fc/script/install.sh",
+    "installer_sha256": "eafcc4594198f60d9f6649665bce57acbc9432a0cf534bbdead2f0c561837b33"
+  },
+  "frontend": {
+    "lockfile": "frontend/package-lock.json",
+    "lockfile_version": 3
+  },
+  "adapter_python": {
+    "lockfile": "requirements.lock"
+  }
+}

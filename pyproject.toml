@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=81", "wheel", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kaguya-qq-bot"
+dynamic = ["version"]
+description = "Portable Kaguya QQ bot profiles and OneBot 11 runtime for Hermes Agent."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Alec" }, { name = "Kaguya contributors" }]
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: AsyncIO",
+    "Topic :: Communications :: Chat",
+]
+keywords = ["onebot", "qq", "hermes", "napcat", "chatbot", "onebot11"]
+dependencies = [
+    "aiohttp>=3.10,<4",
+    "packaging>=23",
+    "pydantic>=2,<3",
+    "ruamel.yaml>=0.18",
+    "regex>=2024.11.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+
+[project.urls]
+Repository = "https://github.com/hoshyo/Kaguya"
+
+[tool.setuptools_scm]
+write_to = "onebot_adapter/_version_scm.py"
+write_to_template = "__version__ = \"{version}\"\n"
+fallback_version = "0.1.0"
+
+[project.scripts]
+hermes-onebot-adapter = "onebot_adapter.__main__:main"
+kaguya-cli = "kaguya_toolkit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["onebot_adapter*", "kaguya_toolkit*"]
+
+[tool.setuptools.package-data]
+"onebot_adapter.webui.static" = ["**/*"]
+"onebot_adapter.hermes_plugin" = ["*.yaml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = [
+    "--ignore=tests/test_aidog_voice.py",
+    "--ignore=tests/test_courtesy_memory_cleanup.py",
+    "--ignore=tests/test_official_api_setup.py",
+    "--ignore=tests/test_persona_voice.py",
+    "--ignore=tests/test_shared_capabilities_plan.py",
+]
+markers = [
+    "no_fake_home: do not monkeypatch Path.home to tmp_path in installer tests",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = [
+    "overlays",
+    "tests/test_aidog_voice.py",
+    "tests/test_courtesy_memory_cleanup.py",
+    "tests/test_official_api_setup.py",
+    "tests/test_persona_voice.py",
+    "tests/test_shared_capabilities_plan.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C901", "PLR0912", "PLR0915"]
+
+[tool.ruff.lint.mccabe]
+# Start with a pragmatic ceiling that blocks monolithic parser/dispatcher
+# functions without forcing unrelated legacy hotspots into the same change.
+max-complexity = 20
+
+[tool.ruff.lint.pylint]
+max-branches = 40
+max-statements = 100

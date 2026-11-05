@@ -1,0 +1,1772 @@
+"""WebSocket server endpoint the Hermes plugin connects to.
+
+The plugin authenticates with a bearer token (``Authorization`` header,
+falling back to query param ``token``). Inbound OneBot events are pushed here; plugin
+send / api-call requests are dispatched to the OneBot API.
+
+All frames on this WS are JSON text frames — no binary frames. Media is
+passed as file paths / URLs in the JSON payload (path passthrough), and
+the adapter forwards them to OneBot/NapCat which reads the local files
+or downloads URLs itself.
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import time
+import uuid
+from collections import deque
+from collections.abc import Awaitable, Callable
+from dataclasses import replace
+from typing import Any
+
+import aiohttp
+import aiohttp.web
+
+from onebot_adapter._async_utils import log_task_exception as _log_task_exception
+from onebot_adapter._async_utils import token_matches, ws_presented_token
+from onebot_adapter.config import AdapterConfig
+from onebot_adapter.group_followup import GroupFollowupTracker
+from onebot_adapter.hermes_plugin.courtesy import internal_notice
+from onebot_adapter.logging_utils import safe_json
+from onebot_adapter.onebot import api as ob
+from onebot_adapter.onebot.log_format import outbound_log_req_id
+from onebot_adapter.onebot.name_resolver import NameResolver
+from onebot_adapter.onebot.seq_map import SeqMap
+from onebot_adapter.outbound_filter import (
+    API_SEND_ACTIONS,
+    extract_api_message_text,
+    extract_send_frame_text,
+    matching_pattern,
+)
+from onebot_adapter.relay.protocol import (
+    NormalizedEvent,
+    error_message,
+    event_message,
+    parse_chat_id,
+    pong_message,
+    ready_message,
+    result_message,
+)
+from onebot_adapter.social_chat import followup_config, policy
+from onebot_adapter.wakeup_batches import combine_wakeups
+
+logger = logging.getLogger(__name__)
+
+
+# Send actions eligible for deduplication.  When the Hermes gateway's
+# ``send_text`` (or any send) times out waiting for the adapter's ``result``
+# frame, it retries with a fresh ``req_id`` but identical payload — we hash the
+# payload (excluding ``req_id``) and short-circuit retries within the TTL.
+_DEDUP_ACTIONS = frozenset({"send_text", "send_image", "send_voice", "send_video", "send_document"})
+
+
+def _send_fingerprint(action: str, data: dict[str, Any]) -> str:
+    """Stable content fingerprint for a send frame.
+
+    Gateway retries reuse the same action + content fields but issue a new
+    ``req_id``, so we hash the payload (excluding ``req_id``) to recognise
+    duplicate send attempts.  Returns a 16-char hex digest.
+    """
+    if action == "send_text":
+        raw = str(data.get("content", ""))
+        if data.get("reply_mention_user_id"):
+            raw += "|reply_mention:" + str(data["reply_mention_user_id"])
+    elif action == "send_image":
+        raw = f"{data.get('image_url', '')}|{data.get('caption', '')}"
+    elif action == "send_voice":
+        raw = f"{data.get('audio_path', '')}|{data.get('caption', '')}"
+    elif action == "send_video":
+        raw = f"{data.get('video_path', '')}|{data.get('caption', '')}"
+    elif action == "send_document":
+        raw = f"{data.get('file_path', '')}|{data.get('filename', '')}"
+    else:  # defensive: never expected since caller filters by _DEDUP_ACTIONS
+        raw = json.dumps(data, sort_keys=True, ensure_ascii=False)
+    if isinstance(data.get("social_part"), dict):
+        raw += "|part:" + json.dumps(data["social_part"], sort_keys=True)
+    if "social_delivery" in data:
+        raw += "|delivery:" + json.dumps(data["social_delivery"], sort_keys=True)
+        raw += "|native_anchor:" + str(data.get("social_reply_anchor", ""))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _append_reply_segment(segs: list[dict], reply_to: Any) -> None:
+    if not reply_to:
+        return
+    try:
+        segs.append(ob.reply_segment(int(reply_to)))
+    except (ValueError, TypeError):
+        pass
+
+
+def _build_send_segments(action: str, data: dict[str, Any]) -> list[dict]:
+    """Build OneBot segments for ordinary message send actions."""
+    segs: list[dict] = []
+    _append_reply_segment(segs, data.get("reply_to"))
+    if action == "send_text":
+        user = data.get("reply_mention_user_id")
+        # This is a transport-owned final-reply recipient, not model text or a
+        # new arbitrary-mention tool. Never interpret "all", CQ text or DMs.
+        if str(data.get("chat_id", "")).startswith("group:") \
+                and data.get("conversation_reply") is True \
+                and isinstance(user, str) \
+                and (user == data.get("conversation_user_id") or user == data.get("_validated_delivery_user")) \
+                and user.isascii() and user.isdecimal() and 0 < len(user) <= 20 and int(user) > 0:
+            segs.append({"type": "at", "data": {"qq": user}})
+            segs.append(ob.text_segment(" "))
+        segs.append(ob.text_segment(data.get("content", "")))
+        return segs
+
+    media_fields: dict[str, tuple[str, Callable[[str], dict]]] = {
+        "send_image": ("image_url", ob.image_segment),
+        "send_voice": ("audio_path", ob.record_segment),
+        "send_video": ("video_path", ob.video_segment),
+    }
+    media_spec = media_fields.get(action)
+    if media_spec is None:
+        raise ValueError(f"unknown action {action!r}")
+    field_name, segment_factory = media_spec
+    file_ref = str(data.get(field_name, ""))
+    if not file_ref:
+        raise ValueError(f"no {field_name} provided")
+    segs.append(segment_factory(file_ref))
+    if data.get("caption"):
+        segs.append(ob.text_segment(data["caption"]))
+    return segs
+
+
+class HermesRelayServer:
+    _RING_BUFFER_SIZE = 50
+    _RING_BUFFER_MAX_AGE = 30.0  # seconds; skip older events on replay
+    _WATCHDOG_INTERVAL = 30.0    # seconds between busy-timeout sweeps
+    # Gateway interrupt_then_dispatch builtins. Hardcoded — they are not in
+    # the plugin ``commands_snapshot`` registry.
+    _INTERRUPT_COMMANDS = frozenset({"stop", "new", "reset"})
+    _SESSION_RESET_COMMANDS = frozenset({"new", "reset"})
+    # Max concurrent OneBot API send calls (send_group_msg / upload_*_file).
+    # NapCat serializes API requests on a single WS, so unbounded concurrency
+    # queues up at NapCat and inflates latency past the plugin's 30s
+    # _RESULT_TIMEOUT, triggering Gateway retries and a death spiral.
+    # Aligned with the plugin-side _MAX_INFLIGHT_SENDS=2.
+    _MAX_CONCURRENT_SENDS = 2
+    _MAX_INFLIGHT_PLUGIN_FRAMES = 64
+    # Send-dedup cache hard cap.  The cache is also TTL-evicted lazily on
+    # lookup, but sends that are never retried (the common case) would
+    # otherwise accumulate forever.  Opportunistic eviction on insert keeps
+    # the dict bounded without a background sweep.
+    _SEND_CACHE_MAX = 4096
+
+    def __init__(
+        self,
+        config: AdapterConfig,
+        api: Any,
+        adapter_version: str,
+        onebot_connected_fn: Callable[[], bool],
+        on_connect: Callable[[], Any] | None = None,
+        on_disconnect: Callable[[], Any] | None = None,
+        on_dispatch: Callable[[NormalizedEvent], Awaitable[None]] | None = None,
+        seq_map: SeqMap | None = None,
+        name_resolver: NameResolver | None = None,
+        local_api_call: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None,
+        group_followups: GroupFollowupTracker | None = None,
+    ) -> None:
+        self._config = config
+        self._api = api
+        self._adapter_version = adapter_version
+        self._onebot_connected_fn = onebot_connected_fn
+        self._on_connect = on_connect
+        self._on_disconnect = on_disconnect
+        self._on_dispatch = on_dispatch
+        self._seq_map = seq_map
+        self._name_resolver = name_resolver
+        self._local_api_call = local_api_call
+        self._group_followups = group_followups
+        self._clients: set[aiohttp.web.WebSocketResponse] = set()
+        self._ring_buffer: deque[tuple[float, NormalizedEvent]] = deque(
+            maxlen=self._RING_BUFFER_SIZE,
+        )
+        # Slash-command registry pushed by the Hermes plugin.  Maps lowercase
+        # command name → command metadata dict.  Empty until the first
+        # ``commands_snapshot`` frame is received.
+        self._commands: dict[str, dict[str, Any]] = {}
+        self._commands_aliases: dict[str, str] = {}  # alias → canonical name
+        # Tasks spawned to handle client text frames / send dispatches.
+        # Tracked in a single global set so ``stop()`` can cancel every
+        # in-flight task (broadcast, dequeue, seq_map populate, …) regardless
+        # of which client originated it.  Per-client cancellation is handled
+        # via the local ``my_tasks`` set in ``_handler``.
+        self._text_tasks: set[asyncio.Task] = set()
+        # Send-dedup cache: (chat_id, action, fingerprint, reply_to) ->
+        # (monotonic_ts, message_id).  Guards against Gateway send retries
+        # (plugin reissues the same payload with a fresh req_id when the
+        # adapter's result frame times out).  Lazy TTL eviction on lookup.
+        self._send_cache: dict[tuple[str, str, str, str], tuple[float, str]] = {}
+        # ── 群聊排队 ──────────────────────────────────────────────────────
+        # Hermes 顶层 group_sessions_per_user 由插件上报(hermes_mode_report 帧)。
+        # True  → Hermes 每个群成员独立 session,无需排队(默认值,安全)
+        # False → 全群共享 session,需排队防止不同成员互相打断
+        # 排队生效条件:per_user=False AND config.event_queue_enabled=True
+        self._hermes_group_sessions_per_user: bool = True
+        self._busy_groups: dict[str, tuple[str, float]] = {}
+        # After /stop|/new|/reset: suppress same-user bypass until idle.
+        self._interrupt_hold: set[str] = set()
+        self._queues: dict[str, deque[NormalizedEvent]] = {}
+        self._group_locks: dict[str, asyncio.Lock] = {}
+        self._event_push_lock = asyncio.Lock()
+        self._watchdog_task: asyncio.Task[None] | None = None
+        # Limit concurrent OneBot API send calls to prevent NapCat WS
+        # serialization from inflating latency past _RESULT_TIMEOUT.
+        self._send_api_semaphore = asyncio.Semaphore(self._MAX_CONCURRENT_SENDS)
+        self._plugin_version: str | None = None
+        self._version_mismatch: bool = True
+        self._latest_plugin_status: dict[str, Any] | None = None
+        self._social_chat = None
+        self._social_clients = set()
+        self._delivery_clients = set()
+        self._courtesy_clients = set()
+        self._batch_clients = set()
+        self._prefill_clients = set()
+        self._active_wakeup_batches = {}
+        self._social_waiters = {}
+        self._social_semaphore = asyncio.Semaphore(2)
+        self._send_receipts = None
+        self._part_locks = {}
+
+    def update_config(self, config: AdapterConfig) -> None:
+        """Hot-reload config without rebuilding the server (route stays bound)."""
+        # Clear the dedup cache only when the dedup policy actually changes —
+        # an unrelated hot-reload (e.g. log_level) must not wipe the cache and
+        # turn a subsequent legit Gateway retry into a duplicate send.
+        old = self._config
+        if (
+            old.send_dedup_enabled != config.send_dedup_enabled
+            or old.send_dedup_ttl_seconds != config.send_dedup_ttl_seconds
+        ):
+            self._send_cache.clear()
+        # Trim any per-chat queues that exceed a newly-lowered cap.
+        new_cap = config.event_queue_max_per_chat
+        for gid, q in list(self._queues.items()):
+            while len(q) > new_cap:
+                q.popleft()
+                logger.warning("relay queue trimmed (config hot-reload): gid=%s", gid)
+        # 排队总开关从 True→False:清空所有 busy/queue,立即放行。
+        if old.event_queue_enabled and not config.event_queue_enabled:
+            if self._busy_groups:
+                logger.info(
+                    "relay: event_queue_enabled disabled, clearing %d busy group(s)",
+                    len(self._busy_groups),
+                )
+            self._clear_queue_state()
+        # 插件运行时配置变化:广播 fresh ready 让插件实时切换。
+        # broadcast_self_id 复用 ready 帧机制,这里用新 config 广播。
+        self._config = config
+        if self._group_followups is not None:
+            self._group_followups.configure(followup_config(config))
+        if (
+            old.media_delivery_mode != config.media_delivery_mode
+            or old.file_upload_timeout != config.file_upload_timeout
+            or old.social_chat != config.social_chat
+        ):
+            logger.info(
+                "relay: plugin runtime config changed, broadcasting fresh ready",
+            )
+            task = asyncio.create_task(self.broadcast_self_id(config.self_id))
+            self._text_tasks.add(task)
+            task.add_done_callback(self._text_tasks.discard)
+            task.add_done_callback(_log_task_exception)
+
+    def _maybe_evict_send_cache(self) -> None:
+        """Opportunistic cap on the send-dedup cache.
+
+        The cache is normally TTL-evicted lazily on lookup, but a send that is
+        never retried (the common case) inserts a key that is never looked up
+        again.  To keep the dict from growing without bound we evict a small
+        batch of the oldest entries whenever the cache exceeds its cap.  We
+        pick the entries with the smallest monotonic timestamp, which is a
+        best-effort FIFO eviction without a separate deque.
+        """
+        if len(self._send_cache) <= self._SEND_CACHE_MAX:
+            return
+        # Evict ~10% of the cap (the oldest by timestamp) to amortise the
+        # O(n) scan over many inserts.
+        excess = len(self._send_cache) - self._SEND_CACHE_MAX + max(1, self._SEND_CACHE_MAX // 10)
+        # sorted() is O(n log n); n is capped (~4k) so this is cheap enough
+        # and only fires when over the cap, not on every insert.
+        for key, _ts in sorted(self._send_cache.items(), key=lambda kv: kv[1][0])[:excess]:
+            self._send_cache.pop(key, None)
+
+    @property
+    def commands(self) -> list[dict[str, Any]]:
+        """Return the current slash-command registry as a list of dicts."""
+        return list(self._commands.values())
+
+    @property
+    def hermes_group_sessions_per_user(self) -> bool:
+        """Hermes 顶层 group_sessions_per_user,由插件通过 hermes_mode_report 帧上报。
+
+        True=每个群成员独立 session(默认,安全);False=全群共享 session,排队有意义。
+        """
+        return self._hermes_group_sessions_per_user
+
+    @property
+    def plugin_version(self) -> str | None:
+        """插件上报的版本号,插件未连接时为 None。"""
+        return self._plugin_version
+
+    @property
+    def version_mismatch(self) -> bool:
+        """插件版本与适配器版本是否不匹配。
+
+        True 表示版本不一致(含插件未连接/未上报),WebUI 应提示重新安装插件。
+        """
+        return self._version_mismatch
+
+    @property
+    def latest_plugin_status(self) -> dict[str, Any] | None:
+        """Latest bounded health/error summary reported by the Hermes plugin."""
+        return dict(self._latest_plugin_status) if self._latest_plugin_status else None
+
+    def _store_hermes_mode(self, group_sessions_per_user: bool) -> None:
+        """缓存插件上报的 Hermes group_sessions_per_user 值。"""
+        old = self._hermes_group_sessions_per_user
+        self._hermes_group_sessions_per_user = bool(group_sessions_per_user)
+        if old != self._hermes_group_sessions_per_user:
+            logger.info(
+                "relay: hermes group_sessions_per_user updated: %s -> %s",
+                old, self._hermes_group_sessions_per_user,
+            )
+            # 从隔离→不隔离,排队可能突然生效;从非隔离→隔离,清空 busy/queue
+            if self._hermes_group_sessions_per_user:
+                if self._busy_groups:
+                    logger.info(
+                        "relay: per_user became True, clearing %d busy group(s)",
+                        len(self._busy_groups),
+                    )
+                self._clear_queue_state()
+
+    def _store_plugin_version(self, plugin_version: str) -> None:
+        """缓存插件上报的版本号并比对。"""
+        self._plugin_version = plugin_version
+        self._version_mismatch = plugin_version != self._adapter_version
+        if self._version_mismatch:
+            logger.warning(
+                "relay: plugin version mismatch — adapter=%s plugin=%s",
+                self._adapter_version, plugin_version,
+            )
+        else:
+            logger.info("relay: plugin version matches adapter (%s)", plugin_version)
+
+    def is_known_command(self, name: str) -> bool:
+        """Check whether *name* (lowercase, without "/") is a registered
+        slash command or an alias of one."""
+        if not name:
+            return False
+        if name == "clean" and self._config.event_queue_clean_command_enabled:
+            return True
+        return name in self._commands or name in self._commands_aliases
+
+    def canonical_command_name(self, name: str) -> str:
+        """Resolve *name* (possibly an alias) to its canonical command name."""
+        if name == "clean" and self._config.event_queue_clean_command_enabled:
+            return name
+        if name in self._commands:
+            return name
+        return self._commands_aliases.get(name, name)
+
+    def _store_commands(self, commands: list[dict[str, Any]]) -> None:
+        """Replace the cached command registry from a commands_snapshot."""
+        self._commands.clear()
+        self._commands_aliases.clear()
+        for cmd in commands or []:
+            name = str(cmd.get("name", "")).lower().strip().lstrip("/")
+            if not name:
+                continue
+            self._commands[name] = cmd
+            for alias in cmd.get("aliases", []) or []:
+                alias_l = str(alias).lower().strip().lstrip("/")
+                if alias_l and alias_l not in self._commands:
+                    self._commands_aliases[alias_l] = name
+        logger.debug(
+            "relay: stored commands_snapshot (%d commands, %d aliases)",
+            len(self._commands), len(self._commands_aliases),
+        )
+
+    def add_routes(self, app: aiohttp.web.Application) -> None:
+        app.router.add_get(self._config.hermes_ws_path, self._handler)
+
+    @property
+    def has_clients(self) -> bool:
+        return bool(self._clients)
+
+    @property
+    def social_status(self):
+        rule = policy(self._config)
+        social = self._social_chat
+        return {"enabled": rule["enabled"], "mode": rule["mode"], "policy_scope": "global",
+                "observer_agent_enabled": rule["observer_agent_enabled"],
+                "observer_profile": "qq-observer" if rule["observer_agent_enabled"] else None,
+                "scheduling": social.adaptive.settings if social is not None else None,
+                "adaptive": {g: {"interval_seconds": state.interval(social.clock()),
+                                  "queued_messages": len(state.pending),
+                                  "pending_opportunities": len(social.adaptive.wakeups.get(g, ())),
+                                  "last_queue_seconds": round(state.last_queue_seconds, 3),
+                                  "last_judge_seconds": round(state.last_judge_seconds, 3),
+                                  "last_action": state.last_action, "consecutive_errors": state.errors}
+                             for g, state in social.adaptive.states.items()} if social is not None else {},
+                "capability_ready": bool(self._clients & self._social_clients),
+                "delivery_enabled": rule["delivery_enabled"],
+                "delivery_capability_ready": bool(self._clients & self._delivery_clients),
+                "courtesy_capability_ready": bool(self._clients & self._courtesy_clients),
+                "busy_wakeup_batch_ready": bool(self._clients & self._batch_clients),
+                "context_prefill_enabled": rule["context_prefill_enabled"],
+                "context_prefill_ready": bool(self._clients & self._prefill_clients),
+                "active_wakeup_batches": {g: len(b["requests"])
+                                           for g, b in self._active_wakeup_batches.items()},
+                "groups": sorted(str(g) for g in self._config.groups
+                                 if self._config.get_group_config(str(g)).enabled),
+                "counters": dict(social.stats) if social is not None else {},
+                "pending_judgments": len(self._social_waiters)}
+
+    async def stop(self) -> None:
+        # Cancel in-flight tasks first so they stop touching the WebSocket
+        # before we close it — otherwise pending sends would log misleading
+        # "send failed" errors against the closing ws.
+        snap = list(self._text_tasks)
+        for task in snap:
+            task.cancel()
+        if snap:
+            await asyncio.gather(*snap, return_exceptions=True)
+        self._text_tasks.clear()
+        # Now close the WebSocket responses (idempotent if already closed).
+        for ws in list(self._clients):
+            await ws.close()
+        self._clients.clear()
+        # Stop the queue watchdog and clear all queue state.
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning("relay: watchdog task raised on cancel", exc_info=True)
+            self._watchdog_task = None
+        self._clear_queue_state()
+
+    async def broadcast_commands_refresh(self) -> None:
+        """Send a ``commands_refresh`` frame to every connected plugin client,
+        asking it to re-collect and push a fresh commands_snapshot."""
+        from onebot_adapter.relay.protocol import commands_refresh_message
+
+        for ws in list(self._clients):
+            try:
+                await ws.send_json(commands_refresh_message())
+            except Exception:
+                logger.warning("relay: failed to send commands_refresh to a client")
+                self._clients.discard(ws)
+
+    async def broadcast_mode_refresh(self) -> None:
+        """Send a ``mode_refresh`` frame to every connected plugin client,
+        asking it to re-read Hermes config and push a fresh
+        ``hermes_mode_report`` (current group_sessions_per_user)."""
+        from onebot_adapter.relay.protocol import mode_refresh_message
+
+        for ws in list(self._clients):
+            try:
+                await ws.send_json(mode_refresh_message())
+            except Exception:
+                logger.warning("relay: failed to send mode_refresh to a client")
+                self._clients.discard(ws)
+
+    async def broadcast_self_id(self, self_id: str) -> None:
+        """Push an updated self_id (and media_delivery_mode) to every connected
+        plugin client by sending a fresh ``ready`` frame.
+
+        Called after _probe_self_id succeeds so that plugins that connected
+        before the probe completes see the new self_id.  Also called when
+        ``media_delivery_mode`` changes via hot-reload — the fresh ready frame
+        carries the new mode so plugins can switch caching strategy without
+        reconnecting.
+        """
+        msg = ready_message(
+            onebot_connected=self._onebot_connected_fn(),
+            adapter_version=self._adapter_version,
+            self_id=self_id,
+            media_delivery_mode=self._config.media_delivery_mode,
+            file_upload_timeout=self._config.file_upload_timeout,
+            social_chat=policy(self._config),
+        )
+        for ws in list(self._clients):
+            try:
+                await ws.send_json(msg)
+            except Exception:
+                logger.warning("relay: failed to send self_id update to a client")
+                self._clients.discard(ws)
+
+    async def _handler(self, request: aiohttp.web.Request) -> aiohttp.web.WebSocketResponse:
+        token = ws_presented_token(request, query_keys=("token",))
+        if not token_matches(token, self._config.hermes_ws_token):
+            logger.warning("Hermes WS unauthorized remote=%s", request.remote)
+            return aiohttp.web.json_response({"error": "unauthorized"}, status=401)
+        ws = aiohttp.web.WebSocketResponse()
+        await ws.prepare(request)
+        role = request.query.get("role", "consumer")
+        is_consumer = role != "rpc"
+        if is_consumer:
+            # The gateway has exactly one event-consumer connection.  Closing
+            # an overlapping stale connection prevents duplicate event
+            # delivery during reconnect races.
+            for old_ws in list(self._clients):
+                await old_ws.close(code=1001, message=b"replaced by new consumer")
+            self._clients.add(ws)
+        my_tasks: set[asyncio.Task] = set()
+        if is_consumer and self._on_connect:
+            self._on_connect()
+        logger.info("Hermes %s WS connected from %s", role, request.remote)
+        await ws.send_json(
+            ready_message(
+                onebot_connected=self._onebot_connected_fn(),
+                adapter_version=self._adapter_version,
+                self_id=self._config.self_id,
+                media_delivery_mode=self._config.media_delivery_mode,
+                file_upload_timeout=self._config.file_upload_timeout,
+                social_chat=policy(self._config),
+            )
+        )
+        # Replay buffered events so a reconnecting plugin doesn't miss messages.
+        replay_ok = await self._replay_ring_buffer(ws) if is_consumer else True
+        if not replay_ok:
+            logger.warning("relay: closing plugin WS after ring buffer replay failure")
+            await ws.close()
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    if len(my_tasks) >= self._MAX_INFLIGHT_PLUGIN_FRAMES:
+                        await asyncio.wait(my_tasks, return_when=asyncio.FIRST_COMPLETED)
+                    task = asyncio.create_task(self._handle_text(ws, msg.data))
+                    self._text_tasks.add(task)
+                    my_tasks.add(task)
+                    task.add_done_callback(self._text_tasks.discard)
+                    task.add_done_callback(my_tasks.discard)
+                    task.add_done_callback(_log_task_exception)
+                elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                    break
+        finally:
+            if is_consumer:
+                self._clients.discard(ws)
+                self._social_clients.discard(ws)
+                self._delivery_clients.discard(ws)
+                self._courtesy_clients.discard(ws)
+                self._batch_clients.discard(ws)
+                self._prefill_clients.discard(ws)
+                for owner, future in list(self._social_waiters.values()):
+                    if owner is ws and not future.done():
+                        future.set_exception(ConnectionError("social consumer disconnected"))
+            if is_consumer and self._on_disconnect:
+                self._on_disconnect()
+            # Cancel this client's in-flight tasks: they hold references to
+            # the now-closed ws and would otherwise log misleading "send
+            # failed" errors on every pending send, plus hold the send
+            # semaphore while waiting for a result that will never arrive.
+            for task in list(my_tasks):
+                task.cancel()
+            if my_tasks:
+                await asyncio.gather(*my_tasks, return_exceptions=True)
+            my_tasks.clear()
+            # When the last plugin client disconnects, clear all queue state:
+            # no one remains to fire idle frames, so busy slots would otherwise
+            # hang until the watchdog times them out.  Clearing immediately
+            # lets a reconnecting plugin start fresh.
+            if is_consumer and not self._clients:
+                if self._busy_groups:
+                    logger.info(
+                        "relay: last plugin disconnected, clearing %d busy group(s)",
+                        len(self._busy_groups),
+                    )
+                self._clear_queue_state()
+                self._plugin_version = None
+                self._version_mismatch = True
+                self._latest_plugin_status = None
+            logger.info(
+                "Hermes %s WS disconnected close_code=%s exception=%r",
+                role, ws.close_code, ws.exception(),
+            )
+        return ws
+
+    # ── Inbound push (adapter -> plugin) ───────────────────────────────
+
+    async def push_event(self, event: NormalizedEvent) -> str:
+        """Push a OneBot event toward the Hermes plugin.
+
+        Writes to the ring buffer (skipping /commands) then routes through
+        the queue policy.  Returns one of:
+
+        - ``"broadcast"``  — the event was delivered to plugin client(s) now.
+        - ``"queued"``     — the event was enqueued for a later idle frame.
+        - ``"handled"``    — an adapter-local command handled the event.
+        - ``"dropped"``    — the event could not be delivered (queue full or
+          zero clients) and was discarded; the caller should NOT react as if
+          it had been delivered.
+        """
+        # Skip slash commands from the ring buffer — control commands like
+        # /restart, /stop, /update must not be replayed to a reconnecting
+        # plugin, otherwise they create an infinite restart loop.
+        async with self._event_push_lock:
+            if not event.delivery_id:
+                event.delivery_id = uuid.uuid4().hex
+            if not event.delivery_ids:
+                event.delivery_ids = [event.delivery_id]
+            logger.debug(
+                "relay push: chat_id=%s message_id=%s delivery_id=%s clients=%d text_len=%d",
+                event.chat_id, event.message_id, event.delivery_id, len(self._clients), len(event.text or ""),
+            )
+            if not (event.passive_reply or event.followup_reply) and not (event.text or "").startswith("/"):
+                self._ring_buffer.append((time.monotonic(), event))
+            return await self._enqueue_or_broadcast(event)
+
+    async def _enqueue_or_broadcast(self, event: NormalizedEvent) -> str:
+        """Apply the per-chat queue policy then broadcast.
+
+        排队生效条件(全部满足):
+        - chat_id 是群聊(``group:<gid>``);私聊直接放行
+        - Hermes 不隔离群成员(``group_sessions_per_user=False``,由插件上报)
+        - 适配器排队总开关打开(``event_queue_enabled=True``)
+        - 非 /命令(/命令绕过排队,与 ring buffer 同思路)
+
+        排队规则:群未 busy → 标记 busy 并广播;群 busy 时若发送者就是
+        当前 busy 用户且队列为空且不在 interrupt hold 内 → 直接广播
+        (刷新 busy 时间戳,不入队,仍算同一 session);否则一律入队 FIFO
+        (含 busy 用户自身,避免插队)。idle 表示该群 Hermes session 已空闲,
+        一帧即可出队; interrupt hold 只挡住 same-user bypass,任意 idle 释放。
+
+        Returns ``"broadcast"``, ``"queued"``, ``"handled"`` or ``"dropped"`` (see push_event).
+        """
+        gid = self._group_id_of(event)
+        command = self._command_name(event.text)
+        if command == "clean" and self._config.event_queue_clean_command_enabled:
+            cleared = 0
+            released_busy = False
+            if gid is not None:
+                cleared = await self._clear_group_queue(gid)
+                released_busy = await self._release_group_busy(gid)
+            if gid is None:
+                message = "当前会话没有群消息队列。"
+            elif released_busy:
+                message = f"已清空当前群聊的排队状态，共 {cleared} 条排队消息，并释放 busy。"
+            else:
+                message = f"已清空当前群聊的消息队列，共 {cleared} 条。"
+            await self.send_direct_message(event.chat_id, message, reply_to=event.message_id or None)
+            return "handled"
+        if gid is None:
+            # 私聊 — 不排队
+            return await self._broadcast_with_status(event)
+        # /命令绕过排队
+        if (event.text or "").startswith("/"):
+            if (
+                command in self._SESSION_RESET_COMMANDS
+                and self._config.event_queue_clear_on_session_reset
+            ):
+                await self._clear_group_queue(gid)
+            return await self._broadcast_slash_command(event, gid, command)
+        # Hermes 隔离群成员 或 适配器总开关关 → 不排队
+        if self._hermes_group_sessions_per_user or not self._config.event_queue_enabled:
+            return await self._broadcast_with_status(event)
+        lock = self._get_group_lock(gid)
+        async with lock:
+            batching = self._can_batch_wakeup(event)
+            if batching and (self._wakeup_handled(gid, event.message_id)
+                             or any(r["message_id"] == event.message_id
+                                    for r in self._active_wakeup_batches.get(gid, {}).get("requests", []))
+                             or any(e.message_id == event.message_id for e in self._queues.get(gid, ()))):
+                self._handle_event_ack({"delivery_ids": event.delivery_ids})
+                return "handled"
+            busy = self._busy_groups.get(gid)
+            if busy is None:
+                # Idle — claim the group and broadcast immediately.
+                self._claim_busy(gid, event.user_id)
+                self._ensure_watchdog()
+                if batching:
+                    event = self._prepare_wakeup_dispatch([event])
+                result = await self._broadcast_with_status(event)
+                if result == "dropped":
+                    # No client received the event — roll back the busy claim so
+                    # the next message (or reconnect replay) can try again.
+                    self._busy_groups.pop(gid, None)
+                    self._active_wakeup_batches.pop(gid, None)
+                    self._clear_interrupt_hold(gid)
+                    self._schedule_group_lock_cleanup(gid)
+                return result
+            # Group busy.
+            if event.passive_reply or event.followup_reply:
+                return "dropped"
+            busy_user_id, _ = busy
+            q = self._queues.get(gid)
+            if (
+                event.user_id == busy_user_id
+                and not batching
+                and not q
+                and not self._interrupt_hold_active(gid)
+            ):
+                # Same sender, nothing waiting: still the in-flight session.
+                # Hold suppresses this so a follow-up cannot land in Hermes
+                # pending while /stop|/new|/reset is draining.
+                self._busy_groups[gid] = (busy_user_id, time.monotonic())
+                logger.info(
+                    "relay same-user bypass: gid=%s busy_user=%s delivery_id=%s text_len=%d",
+                    gid, busy_user_id, event.delivery_id, len(event.text or ""),
+                )
+                return await self._broadcast_with_status(event)
+            q = self._queues.setdefault(gid, deque())
+            cap = self._config.event_queue_max_per_chat
+            if len(q) >= cap:
+                logger.warning(
+                    "relay queue full gid=%s cap=%d delivery_id=%s text_len=%d",
+                    gid, cap, event.delivery_id, len(event.text or ""),
+                )
+                return "dropped"
+            q.append(event)
+            logger.info(
+                "relay enqueue: gid=%s queued=%d busy_user=%s new_user=%s delivery_id=%s text_len=%d",
+                gid, len(q), busy_user_id, event.user_id, event.delivery_id, len(event.text or ""),
+            )
+            return "queued"
+
+    def _can_batch_wakeup(self, event):
+        rule = policy(self._config)
+        return bool(event.wake_only and not event.is_system_notice and self._social_chat is not None
+                    and rule["enabled"] and rule["observer_agent_enabled"] and rule["delivery_enabled"]
+                    and self._clients & self._batch_clients)
+
+    def _wakeup_handled(self, group, message_id):
+        return self._send_receipts is not None and self._send_receipts.wakeup_handled(group, message_id)
+
+    def _wakeup_eligible(self, event):
+        return self._social_chat is None or self._social_chat.guard(
+            event.chat_id.removeprefix("group:"), event.social_reply.get("token"), 0)
+
+    def _batch_current(self, group, token):
+        batch = self._social_chat.turns.get(token, {}).get("wakeup_batch")
+        return not batch or self._active_wakeup_batches.get(group, {}).get("id") == batch["id"]
+
+    def _prepare_wakeup_dispatch(self, events):
+        event = combine_wakeups(events)
+        self._social_chat.prepare_wakeup_batch(event)
+        if policy(self._config)["context_prefill_enabled"] and self._clients & self._prefill_clients:
+            self._social_chat.prefill_wakeup(event)
+        group = event.chat_id.removeprefix("group:")
+        self._active_wakeup_batches[group] = event.wakeup_batch
+        return event
+
+    async def _broadcast_with_status(self, event: NormalizedEvent) -> str:
+        """Broadcast *event* and return ``"broadcast"`` when there is at
+        least one connected client, ``"dropped"`` when there are zero
+        clients (the event is logged but not delivered).  The ring buffer
+        still holds the event for a future reconnect replay.
+        """
+        if not self._clients:
+            logger.warning(
+                "relay broadcast: 0 plugin clients connected — event dropped "
+                "chat_id=%s delivery_id=%s text_len=%d",
+                event.chat_id, event.delivery_id, len(event.text or ""),
+            )
+            return "dropped"
+        delivered = await self._broadcast_event(event)
+        return "dropped" if delivered is False else "broadcast"
+
+    async def _broadcast_slash_command(
+        self, event: NormalizedEvent, gid: str, command: str | None
+    ) -> str:
+        """Broadcast a slash command, arming interrupt hold when needed."""
+        armed = False
+        async with self._get_group_lock(gid):
+            busy = self._busy_groups.get(gid)
+            if busy is not None and command is not None and command in self._INTERRUPT_COMMANDS:
+                self._begin_interrupt_hold(gid)
+                armed = True
+        result = await self._broadcast_with_status(event)
+        if armed and result != "broadcast":
+            async with self._get_group_lock(gid):
+                self._clear_interrupt_hold(gid)
+        return result
+
+    def _get_group_lock(self, gid: str) -> asyncio.Lock:
+        """Get or create a per-group lock for queue state protection.
+
+        Serialises access to ``_busy_groups`` and ``_queues``
+        for a single group so that ``_enqueue_or_broadcast``, ``_handle_idle``,
+        and the watchdog cannot interleave on the same group.
+        """
+        lock = self._group_locks.get(gid)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._group_locks[gid] = lock
+        return lock
+
+    def _schedule_group_lock_cleanup(self, gid: str) -> None:
+        """Drop idle per-group locks after the current critical section exits."""
+        def _cleanup() -> None:
+            lock = self._group_locks.get(gid)
+            if (
+                lock is not None
+                and not lock.locked()
+                and gid not in self._busy_groups
+                and gid not in self._interrupt_hold
+                and not self._queues.get(gid)
+            ):
+                self._group_locks.pop(gid, None)
+
+        asyncio.get_running_loop().call_soon(_cleanup)
+
+    @staticmethod
+    def _group_id_of(event: NormalizedEvent) -> str | None:
+        """Return the bare numeric group id when *event* belongs to a group
+        chat (``chat_id`` == ``group:<gid>``).  Returns ``None`` for DMs.
+
+        The returned string preserves leading zeros (e.g. ``"042"``) so that
+        busy-slot keys are consistent across ``push_event`` / ``_handle_idle``
+        / ``_handle_send`` — never use ``str(int(...))`` for busy-slot keys.
+        """
+        cid = event.chat_id
+        if not cid.startswith("group:"):
+            return None
+        gid = cid[len("group:"):]
+        return gid or None
+
+    @staticmethod
+    def _command_name(text: str) -> str | None:
+        """Return a normalized leading slash-command name, without ``/``."""
+        if not text.startswith("/"):
+            return None
+        token = text.split(maxsplit=1)[0][1:].lower()
+        if "@" in token:
+            token = token.split("@", 1)[0]
+        if not token or "/" in token:
+            return None
+        return token
+
+    async def _clear_group_queue(self, gid: str) -> int:
+        """Discard pending events for one group without interrupting its active turn."""
+        async with self._get_group_lock(gid):
+            queued = list(self._queues.pop(gid, ()))
+            if not queued:
+                self._schedule_group_lock_cleanup(gid)
+                return 0
+
+            queued_object_ids = {id(event) for event in queued}
+            queued_delivery_ids = {
+                delivery_id
+                for event in queued
+                for delivery_id in (event.delivery_ids or ([event.delivery_id] if event.delivery_id else []))
+            }
+            for entry in list(self._ring_buffer):
+                buffered = entry[1]
+                buffered_ids = set(
+                    buffered.delivery_ids
+                    or ([buffered.delivery_id] if buffered.delivery_id else [])
+                )
+                if id(buffered) in queued_object_ids or buffered_ids.intersection(queued_delivery_ids):
+                    self._ring_buffer.remove(entry)
+            logger.info("relay queue cleared: gid=%s discarded=%d", gid, len(queued))
+        self._schedule_group_lock_cleanup(gid)
+        return len(queued)
+
+    def _clear_queue_state(self) -> None:
+        self._busy_groups.clear()
+        self._active_wakeup_batches.clear()
+        self._interrupt_hold.clear()
+        self._queues.clear()
+
+    def _claim_busy(self, gid: str, user_id: str) -> None:
+        """Mark *gid* busy for *user_id*."""
+        self._busy_groups[gid] = (user_id, time.monotonic())
+
+    def _begin_interrupt_hold(self, gid: str) -> None:
+        """Suppress same-user bypass until idle; refresh busy so watchdog waits."""
+        self._interrupt_hold.add(gid)
+        busy = self._busy_groups.get(gid)
+        if busy is not None:
+            self._busy_groups[gid] = (busy[0], time.monotonic())
+
+    def _interrupt_hold_active(self, gid: str) -> bool:
+        return gid in self._interrupt_hold
+
+    def _clear_interrupt_hold(self, gid: str) -> None:
+        self._interrupt_hold.discard(gid)
+
+    async def _release_group_busy(self, gid: str) -> bool:
+        """Drop the busy slot for *gid* without dispatching the next queued event."""
+        async with self._get_group_lock(gid):
+            released = gid in self._busy_groups
+            self._busy_groups.pop(gid, None)
+            self._active_wakeup_batches.pop(gid, None)
+            self._clear_interrupt_hold(gid)
+        self._schedule_group_lock_cleanup(gid)
+        return released
+
+    def _ensure_watchdog(self) -> None:
+        """Start the busy-timeout watchdog if it isn't already running."""
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+    async def _watchdog_loop(self) -> None:
+        """Periodically reap busy slots whose idle signal never arrived.
+
+        Guards against plugin crashes / lost idle frames that would otherwise
+        leave a group permanently stuck in busy state.  When a busy slot
+        exceeds ``event_queue_idle_timeout`` seconds, it is force-cleared and
+        the next queued message (if any) is dispatched.
+        """
+        while True:
+            await asyncio.sleep(self._WATCHDOG_INTERVAL)
+            try:
+                now = time.monotonic()
+                timeout = self._config.event_queue_idle_timeout
+                for gid in list(self._busy_groups.keys()):
+                    async with self._get_group_lock(gid):
+                        busy = self._busy_groups.get(gid)
+                        if busy is None:
+                            continue
+                        busy_user, since = busy
+                        if now - since < timeout:
+                            continue
+                        logger.warning(
+                            "relay busy watchdog: gid=%s busy_user=%s timeout=%.0fs — force-clearing",
+                            gid, busy_user, now - since,
+                        )
+                        self._dequeue_and_dispatch(gid)
+                    self._schedule_group_lock_cleanup(gid)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Never let the watchdog die — a stuck busy slot is worse
+                # than a skipped sweep.  Log and continue.
+                logger.exception("relay watchdog loop iteration crashed; continuing")
+
+    def _dequeue_and_dispatch(self, gid: str) -> None:
+        """Clear the busy slot for *gid* and, if a queued message exists,
+        mark it busy with the queued message's user and broadcast it.
+
+        Synchronous by design — called from idle handler, watchdog, and
+        plugin-disconnect cleanup.  Broadcast is scheduled as a task so the
+        caller doesn't have to await it.
+
+        If no plugin client is currently connected, the busy slot is cleared
+        but the queue is left intact.  The watchdog will retry on its next
+        sweep (every ``_WATCHDOG_INTERVAL`` seconds) once a plugin reconnects.
+        Note: ``_replay_ring_buffer`` clears queue/busy state on reconnect, so
+        queued events from a prior session are discarded there — the ring
+        buffer replays the recent events from scratch.
+        """
+        self._busy_groups.pop(gid, None)
+        self._active_wakeup_batches.pop(gid, None)
+        self._clear_interrupt_hold(gid)
+        if not self._clients:
+            # No plugin connected — leave the queue in place; the watchdog
+            # will retry on its next sweep once a plugin reconnects.
+            return
+        q = self._queues.get(gid)
+        if not q:
+            if q is not None:
+                self._queues.pop(gid, None)
+            return
+        # A prior turn may have explicitly answered a waiting message it read
+        # from history. Read progress alone never removes a queue entry.
+        while q and q[0].wake_only and (self._wakeup_handled(gid, q[0].message_id)
+                                       or not self._wakeup_eligible(q[0])):
+            done = q.popleft()
+            self._handle_event_ack({"delivery_ids": done.delivery_ids})
+        if not q:
+            self._queues.pop(gid, None)
+            return
+        nxt = q.popleft()
+        wakeups = [nxt] if self._can_batch_wakeup(nxt) else []
+        if wakeups:
+            while q and self._can_batch_wakeup(q[0]):
+                event = q.popleft()
+                if not self._wakeup_handled(gid, event.message_id) and self._wakeup_eligible(event):
+                    wakeups.append(event)
+                else:
+                    self._handle_event_ack({"delivery_ids": event.delivery_ids})
+        # Queue entries also live in the replay buffer.  Never mutate the
+        # original object while constructing a merged dispatch.
+        nxt = replace(
+            nxt,
+            media_items=list(nxt.media_items),
+            delivery_ids=list(nxt.delivery_ids or ([nxt.delivery_id] if nxt.delivery_id else [])),
+            recent_group_context=[dict(row) for row in nxt.recent_group_context],
+            context_message_ids=list(nxt.context_message_ids),
+        )
+        # Merge consecutive messages from the same user
+        merged_count = 1
+        merged_message_ids = {nxt.message_id}
+        merged_context_ids = list(nxt.context_message_ids or [nxt.message_id])
+        while (
+            not wakeups and q
+            and q[0].user_id == nxt.user_id
+            and not nxt.media_items
+            and not q[0].media_items
+            and not nxt.reply_to_message_id
+            and not q[0].reply_to_message_id
+            and not nxt.is_system_notice
+            and not q[0].is_system_notice
+        ):
+            next_msg = q.popleft()
+            merged_message_ids.add(next_msg.message_id)
+            merged_context_ids.extend(next_msg.context_message_ids or [next_msg.message_id])
+            nxt.context_message_ids = list(dict.fromkeys(merged_context_ids))[-50:]
+            nxt.recent_group_context = [dict(row) for row in next_msg.recent_group_context
+                                        if row.get("message_id") not in merged_message_ids]
+            if next_msg.text:
+                nxt.text = (nxt.text or "") + "\n\n" + next_msg.text
+            nxt.timestamp = next_msg.timestamp
+            nxt.message_id = next_msg.message_id
+            nxt.real_seq = next_msg.real_seq
+            nxt.delivery_ids.extend(
+                next_msg.delivery_ids
+                or ([next_msg.delivery_id] if next_msg.delivery_id else [])
+            )
+            merged_count += 1
+        if merged_count > 1:
+            logger.info(
+                "relay dequeue merge: gid=%s user=%s merged=%d delivery_ids=%s text_len=%d",
+                gid, nxt.user_id, merged_count, nxt.delivery_ids, len(nxt.text or ""),
+            )
+        if not q:
+            self._queues.pop(gid, None)
+        self._claim_busy(gid, nxt.user_id)
+        if wakeups:
+            nxt = self._prepare_wakeup_dispatch(wakeups)
+            merged_count = len(wakeups)
+        self._ensure_watchdog()
+        # Schedule the broadcast + on_dispatch as a single tracked task so
+        # stop() can cancel it and _on_dispatch only fires when the event
+        # was actually delivered (at least one client received it).
+        async def _dispatch_nxt() -> None:
+            delivered = await self._broadcast_event(nxt)
+            if delivered is not False and self._on_dispatch is not None:
+                await self._on_dispatch(nxt)
+            elif delivered is False:
+                async with self._get_group_lock(gid):
+                    current = self._busy_groups.get(gid)
+                    if current and current[0] == nxt.user_id:
+                        self._busy_groups.pop(gid, None)
+                        self._active_wakeup_batches.pop(gid, None)
+                        self._clear_interrupt_hold(gid)
+                self._schedule_group_lock_cleanup(gid)
+
+        task = asyncio.create_task(_dispatch_nxt())
+        self._text_tasks.add(task)
+        task.add_done_callback(self._text_tasks.discard)
+        task.add_done_callback(_log_task_exception)
+        logger.info(
+            "relay dequeue: gid=%s remaining=%d new_busy_user=%s merged=%d delivery_ids=%s text_len=%d",
+            gid, len(self._queues.get(gid, ())), nxt.user_id, merged_count, nxt.delivery_ids, len(nxt.text or ""),
+        )
+
+    async def _handle_idle(self, data: dict[str, Any]) -> None:
+        """Handle an ``idle`` frame from the Hermes plugin.
+
+        The plugin fires this when a shared-group session has no
+        pending/debounce follow-up left.  Treat it as session-idle: clear
+        busy and dispatch the next queued message (also clears interrupt hold).
+        """
+        gid = str(data.get("group_id", ""))
+        if not gid:
+            # Fall back to parsing chat_id if group_id absent (defensive).
+            # Use the raw substring (preserving leading zeros) so the busy-slot
+            # key matches what _group_id_of / _handle_send used when claiming.
+            cid = str(data.get("chat_id", ""))
+            if cid.startswith("group:"):
+                gid = cid[len("group:"):]
+            else:
+                logger.warning("relay idle frame without group_id, ignoring: %s", data)
+                return
+        if not gid:
+            logger.warning("relay idle frame without group_id, ignoring: %s", data)
+            return
+        lock = self._get_group_lock(gid)
+        async with lock:
+            active_batch = self._active_wakeup_batches.get(gid)
+            if active_batch and data.get("wakeup_batch_id") != active_batch["id"] \
+                    and not self._interrupt_hold_active(gid):
+                logger.info("relay ignores stale/unscoped batch idle gid=%s", gid)
+                return
+            if active_batch and data.get("wakeup_batch_id") == active_batch["id"] \
+                    and data.get("wakeup_processed") is True and self._send_receipts is not None:
+                self._send_receipts.mark_wakeups_handled(gid, [r["message_id"] for r in active_batch["requests"]])
+            if gid not in self._busy_groups:
+                logger.info("relay idle for non-busy gid=%s (already cleared by watchdog/replay/disconnect)", gid)
+                return
+            logger.info(
+                "relay idle: gid=%s hold=%s — dispatching next queued",
+                gid,
+                gid in self._interrupt_hold,
+            )
+            self._dequeue_and_dispatch(gid)
+        self._schedule_group_lock_cleanup(gid)
+
+    async def _broadcast_event(self, event: NormalizedEvent) -> bool:
+        """Broadcast *event* to all connected plugin clients.
+
+        Returns ``True`` if at least one client received the event,
+        ``False`` if there were zero clients or all sends failed.
+        """
+        n_clients = len(self._clients)
+        if n_clients == 0:
+            logger.warning(
+                "relay broadcast: 0 plugin clients connected — event dropped "
+                "chat_id=%s delivery_id=%s text_len=%d",
+                event.chat_id, event.delivery_id, len(event.text or ""),
+            )
+            return False
+        logger.debug("relay broadcast: sending to %d client(s)", n_clients)
+        frame = event_message(event)
+        logger.debug("relay broadcast event frame: %s", safe_json(frame))
+        delivered = False
+        for ws in list(self._clients):
+            try:
+                await ws.send_json(frame)
+                delivered = True
+            except Exception:
+                logger.exception("push_event failed; dropping client")
+                self._clients.discard(ws)
+        return delivered
+
+    async def _replay_ring_buffer(self, ws: aiohttp.web.WebSocketResponse) -> bool:
+        """Send buffered events to a newly-connected plugin.
+
+        Skips events older than ``_RING_BUFFER_MAX_AGE`` seconds so that a
+        full gateway restart (which takes longer than a brief WS blip) does
+        not replay stale commands like ``/restart`` — which would otherwise
+        create an infinite restart loop.
+
+        The replay routes each event through ``_enqueue_or_broadcast`` so that
+        shared-group messages serialize: only the first broadcasts, the rest
+        enqueue behind a fresh busy slot.  Any pre-existing queue/busy state
+        from a prior session is cleared first so the replay rebuilds state
+        from scratch — queued events from the dropped session are discarded
+        because they're already in the ring buffer and will be re-evaluated.
+
+        Returns ``True`` if every buffered entry was processed without a send
+        failure.  Returns ``False`` if a send failed mid-entry: in that case
+        the offending entry is purged from the ring buffer and the caller must
+        close the now-dirty WebSocket.
+        """
+        async with self._event_push_lock:
+            if not self._ring_buffer:
+                return True
+            return await self._replay_ring_buffer_locked(ws)
+
+    async def _replay_ring_buffer_locked(self, ws: aiohttp.web.WebSocketResponse) -> bool:
+        # Clear any leftover queue state from the previous (now-dead) session
+        # so the replay rebuilds busy/queue state cleanly from the buffer.
+        self._clear_queue_state()
+        now = time.monotonic()
+        cutoff = now - self._RING_BUFFER_MAX_AGE
+        # Snapshot before any concurrent push can append; entries added after
+        # this point are handled by push_event once the replay lock is released.
+        snapshot = list(self._ring_buffer)
+        for entry in snapshot:
+            ts, event = entry
+            if ts < cutoff:
+                continue
+            # Route through the queue policy so a reconnecting plugin doesn't
+            # receive a burst of shared-group messages all at once — only the
+            # first one broadcasts, the rest enqueue behind the busy slot.
+            # We detect send failures by checking the client set state before
+            # vs after: if the ws was dropped during broadcast, the entry is
+            # treated as failed and purged.
+            ws_before = ws in self._clients
+            try:
+                await self._enqueue_or_broadcast(event)
+            except Exception:
+                logger.warning(
+                    "ring buffer replay failed; purging entry delivery_id=%s text_len=%d",
+                    event.delivery_id, len(event.text or ""),
+                    exc_info=True,
+                )
+                try:
+                    self._ring_buffer.remove(entry)
+                except ValueError:
+                    pass  # already gone (concurrent replay on same ws)
+                return False
+            # If the ws was dropped during the broadcast (send failure inside
+            # _broadcast_event drops the client), treat as failed replay.
+            if ws_before and ws not in self._clients:
+                logger.warning(
+                    "ring buffer replay ws dropped mid-send; purging entry delivery_id=%s text_len=%d",
+                    event.delivery_id, len(event.text or ""),
+                )
+                try:
+                    self._ring_buffer.remove(entry)
+                except ValueError:
+                    pass
+                return False
+        return True
+
+    # ── Outbound dispatch (plugin -> adapter) ──────────────────────────
+
+    async def _handle_text(self, ws: aiohttp.web.WebSocketResponse, raw: str) -> None:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            await ws.send_json(error_message("bad_json", "invalid JSON frame"))
+            return
+        mtype = data.get("type")
+        logger.debug(
+            "relay recv from plugin: type=%s action=%s frame=%s",
+            mtype, data.get("action", ""), safe_json(data),
+        )
+        if mtype == "ping":
+            await ws.send_json(pong_message())
+            return
+        if mtype == "social_result":
+            pending = self._social_waiters.get(data.get("req_id"))
+            if pending is not None and pending[0] is ws and not pending[1].done():
+                if data.get("error"):
+                    # Operational failures are not the model deciding to stay quiet.
+                    # Keep the message fixed: peer exception bodies may contain secrets.
+                    pending[1].set_exception(RuntimeError("social judgment failed in Hermes plugin"))
+                else:
+                    pending[1].set_result(data.get("result"))
+            return
+        if mtype == "send":
+            await self._handle_send(ws, data)
+            return
+        if mtype == "api_call":
+            await self._handle_api_call(ws, data)
+            return
+        if mtype == "commands_snapshot":
+            self._store_commands(data.get("commands", []) or [])
+            return
+        if mtype == "hermes_mode_report":
+            self._store_hermes_mode(bool(data.get("group_sessions_per_user", True)))
+            return
+        if mtype == "idle":
+            await self._handle_idle(data)
+            return
+        if mtype == "plugin_info":
+            if ws in self._clients and "social_chat_v1" in (data.get("capabilities") or []):
+                self._social_clients.add(ws)
+            if ws in self._clients and "expression_routing_v1" in (data.get("capabilities") or []):
+                self._delivery_clients.add(ws)
+            if ws in self._clients and "member_courtesy_v1" in (data.get("capabilities") or []):
+                self._courtesy_clients.add(ws)
+            if ws in self._clients and "busy_wakeup_batch_v1" in (data.get("capabilities") or []):
+                self._batch_clients.add(ws)
+            if ws in self._clients and "time_history_prefill_v1" in (data.get("capabilities") or []):
+                self._prefill_clients.add(ws)
+            self._store_plugin_version(str(data.get("plugin_version", "")))
+            return
+        if mtype == "plugin_status":
+            level = str(data.get("level", "info")).lower()
+            try:
+                status_timestamp = float(data.get("timestamp", time.time()))
+            except (TypeError, ValueError):
+                status_timestamp = time.time()
+            status = {
+                "level": level if level in {"info", "warning", "error"} else "info",
+                "event": str(data.get("event", "unknown"))[:80],
+                "message": str(data.get("message", ""))[:500],
+                "timestamp": status_timestamp,
+            }
+            self._latest_plugin_status = status
+            log_fn = logger.error if status["level"] == "error" else (
+                logger.warning if status["level"] == "warning" else logger.info
+            )
+            log_fn(
+                "Hermes plugin status level=%s event=%s message=%s",
+                status["level"], status["event"], status["message"],
+            )
+            return
+        if mtype == "event_ack":
+            self._handle_event_ack(data)
+            return
+        await ws.send_json(error_message("unknown_type", f"unknown type {mtype!r}"))
+
+    def _handle_event_ack(self, data: dict[str, Any]) -> None:
+        """Remove successfully processed deliveries from the replay buffer."""
+        acked = {str(x) for x in (data.get("delivery_ids") or []) if x}
+        single = str(data.get("delivery_id", "") or "")
+        if single:
+            acked.add(single)
+        if not acked:
+            return
+        for entry in list(self._ring_buffer):
+            event = entry[1]
+            ids = set(event.delivery_ids or ([event.delivery_id] if event.delivery_id else []))
+            if ids and ids.issubset(acked):
+                try:
+                    self._ring_buffer.remove(entry)
+                except ValueError:
+                    pass
+
+    async def request_social_judgment(self, payload):
+        async with self._social_semaphore:
+            clients = self._clients & self._social_clients
+            if not clients:
+                raise ConnectionError("social judgment capability unavailable")
+            ws = next(iter(clients))
+            req_id = uuid.uuid4().hex
+            future = asyncio.get_running_loop().create_future()
+            self._social_waiters[req_id] = (ws, future)
+            try:
+                await ws.send_json({"type": "social_judge", "v": 1, "req_id": req_id, "payload": payload})
+                return await asyncio.wait_for(future, policy(self._config)["judge_timeout_seconds"])
+            finally:
+                self._social_waiters.pop(req_id, None)
+
+    async def _handle_send(self, ws: aiohttp.web.WebSocketResponse, data: dict[str, Any]) -> None:
+        if data.get("action") == "send_text" and str(data.get("chat_id", "")).startswith("group:") \
+                and internal_notice(data.get("content")):
+            await ws.send_json(result_message(data.get("req_id", ""), True,
+                                              data={"suppressed": True, "reason": "internal_notice"}))
+            return
+        # Transport-only validation stamps can never be supplied by peers/models.
+        data = {k: v for k, v in data.items() if not str(k).startswith("_delivery_")
+                and k != "_validated_delivery_user"}
+        part = data.get("social_part")
+        if not isinstance(part, dict) or self._social_chat is None or self._send_receipts is None:
+            return await self._handle_send_impl(ws, data)
+        try:
+            await self._handle_send_part(ws, data, part)
+        except PermissionError:
+            logger.warning("delivery target rejected; no QQ message sent")
+            await ws.send_json(result_message(data.get("req_id", ""), False,
+                                              error="delivery target unavailable", retryable=False))
+        except Exception:
+            logger.exception("social part receipt unavailable; send suppressed")
+            await ws.send_json(result_message(data.get("req_id", ""), False,
+                                              error="send receipt unavailable", retryable=False))
+
+    async def _handle_send_part(self, ws, data, part):
+        chat, token, index = str(data.get("chat_id", "")), part.get("token"), part.get("index")
+        if not chat.startswith("group:") or not isinstance(token, str) or len(token) != 32 \
+                or type(index) is not int or not 0 <= index < 20:
+            await ws.send_json(result_message(data.get("req_id", ""), False,
+                                              error="invalid social part", retryable=False))
+            return
+        reply_id = part.get("reply_id")
+        if "reply_id" in part:
+            batch = self._social_chat.turns.get(token, {}).get("wakeup_batch", {})
+            if type(reply_id) is not int or not 0 <= reply_id < 20 or len(batch.get("requests", [])) < 2:
+                raise PermissionError("reply index outside a live wakeup batch")
+        identity = f"{chat}:{token}:{index}" if reply_id is None else f"{chat}:{token}:reply:{reply_id}:{index}"
+        key = hashlib.sha256(identity.encode()).hexdigest()
+        lock = self._part_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            fingerprint = _send_fingerprint(str(data.get("action")), data)
+            receipt = self._send_receipts.lookup(key, fingerprint)
+            if receipt is not None:
+                await ws.send_json({"type": "result", "v": 1, "req_id": data.get("req_id"), **receipt})
+                return
+            if not self._social_chat.guard(chat[6:], token, index) or not self._batch_current(chat[6:], token):
+                await ws.send_json(result_message(data.get("req_id", ""), True, data={"suppressed": True}))
+                return
+            prepared = data
+            if self._social_chat.rule["delivery_enabled"] and data.get("action") == "send_text":
+                prepared = {k: v for k, v in data.items() if k not in {"reply_to", "reply_mention_user_id"}}
+                fields = self._social_chat.delivery_fields(chat[6:], token, data.get("social_delivery"), index=index,
+                                                           anchor_override=data.get("social_reply_anchor"))
+                prepared.update(fields)
+                if index == 0:
+                    logger.info("delivery decision: group=%s mode=%s reply_to=%s recipient=%s notify=%s fallback=%s",
+                                chat[6:], fields["_delivery_mode"], fields.get("reply_to", ""),
+                                fields["_delivery_recipient"], bool(fields.get("reply_mention_user_id")),
+                                fields["_delivery_fallback"])
+            self._send_receipts.claim(key, fingerprint)
+            server = self
+
+            class ReceiptWS:
+                async def send_json(self, result):
+                    if result.get("success"):
+                        server._send_receipts.complete(key, result)
+                        if result.get("message_id") and prepared.get("_delivery_message_id") \
+                                and server._social_chat.turns.get(token, {}).get("wakeup_batch"):
+                            server._send_receipts.mark_wakeups_handled(chat[6:], [prepared["_delivery_message_id"]])
+                    else:
+                        result["retryable"] = False  # failure can mean unknown external outcome
+                    await ws.send_json(result)
+
+            try:
+                await self._handle_send_impl(ReceiptWS(), prepared)
+            finally:
+                # Existing waiters still hold this lock; keep it until all are
+                # done. Bounded by one day of the configured admission budget.
+                if len(self._part_locks) > 10000:
+                    self._part_locks = {k: v for k, v in self._part_locks.items() if v.locked()}
+
+    def _social_send_current(self, group, data):
+        part = data.get("social_part")
+        if not isinstance(part, dict) or self._social_chat is None:
+            return True
+        if not self._social_chat.guard(group, part.get("token"), part.get("index", 0)):
+            return False
+        if not self._batch_current(group, part.get("token")):
+            return False
+        if "_delivery_mode" in data:
+            try:
+                self._social_chat.delivery_fields(group, part["token"], data.get("social_delivery"),
+                                                   index=part.get("index", 0),
+                                                   anchor_override=data.get("social_reply_anchor"))
+            except PermissionError:
+                return False
+        return True
+
+    async def _handle_send_impl(self, ws: aiohttp.web.WebSocketResponse, data: dict[str, Any]) -> None:
+        req_id = data.get("req_id", str(uuid.uuid4()))
+        action = data.get("action")
+        chat_id = data.get("chat_id", "")
+        try:
+            is_group, num_id = parse_chat_id(chat_id)
+            # ── 去重:Gateway send 超时重试时,插件带新 req_id 重发同样内容 ──
+            # 命中且未过期则直接回缓存结果,跳过实际发送/SeqMap/log。
+            dedup_hit, dedup_key = await self._check_send_dedup(
+                ws, req_id, chat_id, str(action), data,
+            )
+            if dedup_hit:
+                return
+
+            if self._drop_filtered_send(action, data, is_group, num_id):
+                if dedup_key is not None:
+                    self._send_cache[dedup_key] = (time.monotonic(), "")
+                    self._maybe_evict_send_cache()
+                await self._touch_busy_group(chat_id, is_group)
+                await ws.send_json(result_message(req_id, True, data={"filtered": True}))
+                return
+
+            req_token = outbound_log_req_id.set(str(req_id))
+            try:
+                if action == "send_document":
+                    await self._send_document(data, req_id, chat_id, is_group, num_id)
+                    if dedup_key is not None:
+                        self._send_cache[dedup_key] = (time.monotonic(), "")
+                        self._maybe_evict_send_cache()
+                    await self._touch_busy_group(chat_id, is_group)
+                    await ws.send_json(result_message(req_id, True))
+                    return
+
+                segs = _build_send_segments(str(action), data)
+
+                if is_group:
+                    async with self._send_api_semaphore:
+                        if not self._social_send_current(str(num_id), data):
+                            logger.info("delivery suppressed: group=%s reason=stale_or_revoked", num_id)
+                            await ws.send_json(result_message(req_id, True, data={"suppressed": True}))
+                            return
+                        resp = await self._api.send_group_msg(num_id, segs)
+                else:
+                    async with self._send_api_semaphore:
+                        resp = await self._api.send_private_msg(num_id, segs)
+                msg_id = str(resp.get("message_id", ""))
+                self._record_conversation_reply(data, chat_id, msg_id)
+                # 写入去重缓存:在 SeqMap/log 之前,确保后续步骤异常时重试仍能命中。
+                if dedup_key is not None:
+                    self._send_cache[dedup_key] = (time.monotonic(), msg_id)
+                    self._maybe_evict_send_cache()
+                logger.debug(
+                    "relay send response: action=%s chat_id=%s msg_id=%s resp=%s",
+                    action, chat_id, msg_id, safe_json(resp, 1000),
+                )
+            finally:
+                outbound_log_req_id.reset(req_token)
+            # result frame 必须先回 plugin,SeqMap 补写后置为 fire-and-forget。
+            # 原因:get_msg 走同一条 OneBot WS,NapCat 串行处理 API 请求,
+            # 多人并发 send 时 get_msg 排队累积延迟会拖慢 result frame 回传,
+            # 触发 plugin _RESULT_TIMEOUT(30s)→ Gateway _send_with_retry 重试 →
+            # dedup TTL 过期 → 群里重复发送(刷屏)。
+            await ws.send_json(result_message(req_id, True, message_id=msg_id))
+            # Hermes 发出的任意消息(send_text / 长任务心跳等)都说明 agent 仍在活跃,
+            # 顺便刷新该群 busy 槽的时间戳,防止看门狗误判超时。busy 槽用原始群号
+            # 字符串作 key(保留前导零),与 _group_id_of / _handle_idle 保持一致。
+            await self._touch_busy_group(chat_id, is_group)
+            if self._seq_map is not None and is_group and msg_id:
+                task = asyncio.create_task(
+                    self._populate_seq_map(str(num_id), msg_id),
+                    name=f"seq_map_populate:{num_id}:{msg_id}",
+                )
+                self._text_tasks.add(task)
+                task.add_done_callback(self._text_tasks.discard)
+                task.add_done_callback(_log_task_exception)
+        except ob.UploadOutcomeUnknownError as exc:
+            logger.warning("send outcome unknown and must not be retried automatically: %s", exc)
+            await ws.send_json(result_message(req_id, False, error=str(exc), retryable=False))
+        except Exception as exc:
+            logger.exception("send failed")
+            await ws.send_json(result_message(req_id, False, error=str(exc)))
+
+    def _record_conversation_reply(self, data, chat_id, message_id):
+        if self._group_followups is None or data.get("conversation_reply") is not True:
+            return
+        if not chat_id.startswith("group:"):
+            return
+        group = chat_id[len("group:"):]
+        busy = self._busy_groups.get(group)
+        user = str(data.get("conversation_user_id", ""))
+        if busy is not None and user == busy[0]:
+            # Public delivery and conversational continuity are independent:
+            # group mode deliberately has no quote/@ recipient, but must not
+            # discard the trusted member whose turn produced this reply.
+            # An explicitly addressed member still takes precedence. This
+            # only opens a bounded followup candidate, never a forced reply.
+            recipient = data.get("_delivery_recipient") or user
+            if self._social_chat is not None:
+                self._social_chat.successful_reply(
+                    group, recipient, message_id, data.get("content", data.get("caption", "")),
+                    **({"image": True} if data.get("action") == "send_image" else {}),
+                )
+            else:
+                self._group_followups.record_reply(group, recipient, message_id)
+            logger.info("followup: final reply anchored for group=%s", group)
+
+    async def _check_send_dedup(
+        self,
+        ws: aiohttp.web.WebSocketResponse,
+        req_id: str,
+        chat_id: str,
+        action: str,
+        data: dict[str, Any],
+    ) -> tuple[bool, tuple[str, str, str, str] | None]:
+        if not self._config.send_dedup_enabled or action not in _DEDUP_ACTIONS:
+            return False, None
+        key = (
+            chat_id,
+            action,
+            _send_fingerprint(action, data),
+            str(data.get("reply_to", "")),
+        )
+        cached = self._send_cache.get(key)
+        if cached is None:
+            return False, key
+        cached_ts, cached_msg_id = cached
+        age = time.monotonic() - cached_ts
+        if age > self._config.send_dedup_ttl_seconds:
+            self._send_cache.pop(key, None)
+            return False, key
+        logger.info(
+            "relay dedup hit: action=%s chat_id=%s cached_msg_id=%s age=%.1fs",
+            action, chat_id, cached_msg_id, age,
+        )
+        await ws.send_json(result_message(req_id, True, message_id=cached_msg_id or None))
+        return True, key
+
+    async def _send_document(
+        self,
+        data: dict[str, Any],
+        req_id: str,
+        chat_id: str,
+        is_group: bool,
+        num_id: int,
+    ) -> None:
+        file_ref = str(data.get("file_path", ""))
+        if not file_ref:
+            raise ValueError("no file_path provided")
+        filename = data.get("filename") or file_ref.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        async with self._send_api_semaphore:
+            if is_group:
+                await self._api.upload_group_file(num_id, file_ref, filename)
+            else:
+                await self._api.upload_private_file(num_id, file_ref, filename)
+
+        caption_segs: list[dict] = []
+        _append_reply_segment(caption_segs, data.get("reply_to"))
+        if data.get("caption"):
+            caption_segs.append(ob.text_segment(data["caption"]))
+        if not caption_segs:
+            return
+        async with self._send_api_semaphore:
+            if is_group:
+                await self._api.send_group_msg(num_id, caption_segs)
+            else:
+                await self._api.send_private_msg(num_id, caption_segs)
+
+    async def _touch_busy_group(self, chat_id: str, is_group: bool) -> None:
+        if not is_group or not chat_id.startswith("group:"):
+            return
+        raw_gid = chat_id[len("group:"):]
+        lock = self._get_group_lock(raw_gid)
+        async with lock:
+            busy = self._busy_groups.get(raw_gid)
+            if busy is None:
+                return
+            busy_user, _ = busy
+            self._busy_groups[raw_gid] = (busy_user, time.monotonic())
+
+    async def _populate_seq_map(self, group_id: str, msg_id: str) -> None:
+        """Fire-and-forget: fetch real_seq for a bot-sent group message and
+        populate the SeqMap so later tool calls can resolve real_seq → message_id.
+
+        Runs after the ``result`` frame has already been sent to the plugin so
+        that a slow/queued ``get_msg`` on NapCat's serial WS cannot delay the
+        result frame and trigger a Gateway send retry (which caused the
+        multi-user flood).  Errors are logged at warning level (vs the
+        previous debug) because this task runs detached and silent failures
+        would mask a persistent NapCat issue.
+        """
+        try:
+            got = await self._api.get_msg(int(msg_id))
+            rs = str(got.get("real_seq", "") or "")
+            if rs:
+                self._seq_map.add(group_id, int(rs), msg_id)
+                logger.debug("seq_map populated: group=%s msg_id=%s real_seq=%s", group_id, msg_id, rs)
+            else:
+                logger.debug("seq_map populate: no real_seq in get_msg response (msg_id=%s)", msg_id)
+        except Exception as exc:
+            logger.warning("seq_map populate failed (group=%s msg_id=%s): %s", group_id, msg_id, exc)
+
+    async def _handle_api_call(self, ws: aiohttp.web.WebSocketResponse, data: dict[str, Any]) -> None:
+        req_id = data.get("req_id", str(uuid.uuid4()))
+        action = data.get("action", "")
+        params = data.get("params", {}) or {}
+        logger.debug("relay api_call: action=%s req_id=%s", action, req_id)
+        logger.debug("relay api_call params: %s", safe_json(params))
+        req_token = outbound_log_req_id.set(str(req_id))
+        try:
+            if self._local_api_call is not None and action.startswith("adapter_"):
+                try:
+                    result = await self._local_api_call(action, params)
+                    await ws.send_json(result_message(req_id, True, data=result))
+                except Exception as exc:
+                    logger.warning("local api_call %s failed: %s", action, exc)
+                    await ws.send_json(result_message(req_id, False, error=str(exc)))
+                return
+            # 拦截 real_seq → message_id 转换(适配器侧 SeqMap 查询)
+            params = self._resolve_seq_params(action, params)
+            if action in API_SEND_ACTIONS and self._drop_filtered_api_call(params):
+                await ws.send_json(result_message(req_id, True, data={"filtered": True}))
+                return
+            try:
+                result = await self._api.call(action, params)
+                logger.debug(
+                    "relay api_call result: action=%s ok=True data=%s",
+                    action, safe_json(result.get("data")),
+                )
+                await ws.send_json(result_message(req_id, True, data=result.get("data")))
+            except ob.UploadOutcomeUnknownError as exc:
+                logger.warning("api_call %s outcome unknown: %s", action, exc)
+                await ws.send_json(result_message(req_id, False, error=str(exc), retryable=False))
+            except Exception as exc:
+                logger.warning("api_call %s failed: %s", action, exc)
+                await ws.send_json(result_message(req_id, False, error=str(exc)))
+        finally:
+            outbound_log_req_id.reset(req_token)
+
+    def _drop_filtered_send(
+        self, action: str, data: dict[str, Any], is_group: bool, num_id: int,
+    ) -> bool:
+        """True when a Hermes ``send`` frame should be silently dropped."""
+        group_id = str(num_id) if is_group else None
+        if not self._config.resolve_outbound_filter_enabled(group_id):
+            return False
+        text = extract_send_frame_text(str(action), data)
+        pattern = matching_pattern(text, self._config.resolve_outbound_filter_patterns(group_id))
+        if pattern is None:
+            return False
+        logger.info(
+            "relay outbound filter hit: action=%s group_id=%s pattern=%s preview=%s",
+            action, group_id, pattern, text[: self._config.log_message_preview],
+        )
+        return True
+
+    def _drop_filtered_api_call(self, params: dict[str, Any]) -> bool:
+        """True when a Hermes ``send_msg``-family API call should be dropped."""
+        raw_gid = params.get("group_id")
+        group_id = str(raw_gid) if raw_gid not in (None, "") else None
+        if not self._config.resolve_outbound_filter_enabled(group_id):
+            return False
+        text = extract_api_message_text(params)
+        pattern = matching_pattern(text, self._config.resolve_outbound_filter_patterns(group_id))
+        if pattern is None:
+            return False
+        logger.info(
+            "relay outbound filter hit: api_call group_id=%s pattern=%s preview=%s",
+            group_id, pattern, text[: self._config.log_message_preview],
+        )
+        return True
+
+    def _resolve_seq_params(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
+        """拦截需要 real_seq→message_id 转换的 action。
+
+        插件侧工具传的是 ``real_seq`` + ``group_id``(群聊)或 ``user_id``(私聊),
+        这里查 SeqMap 转成 ``message_id`` 再调 OneBot API。查不到时透传 real_seq
+        当 message_id(兼容 go-cqhttp/Lagrange,它们前缀显示的就是 message_id)。
+
+        ``group_id``/``user_id`` 原样保留传给 OneBot API(``mark_msg_as_read`` 等
+        需要 group_id 上下文定位会话)。
+        """
+        if self._seq_map is None:
+            return params
+        seq_actions = {
+            "cancel_group_todo",
+            "complete_group_todo",
+            "delete_essence_msg",
+            "delete_msg",
+            "fetch_emoji_like",
+            "forward_friend_single_msg",
+            "forward_group_single_msg",
+            "get_emoji_likes",
+            "get_msg",
+            "mark_msg_as_read",
+            "set_essence_msg",
+            "set_group_todo",
+            "set_msg_emoji_like",
+        }
+        if action not in seq_actions:
+            return params
+        real_seq = params.pop("real_seq", None)
+        if real_seq is None:
+            return params  # mark_msg_as_read 可能不传 real_seq(标记全部已读)
+        # scope_id:群聊用 group_id,私聊用 user_id(SeqMap 存储约定)
+        group_id = params.get("group_id")
+        user_id = params.get("user_id")
+        scope_id = str(group_id) if group_id else (str(user_id) if user_id else "")
+        try:
+            seq_int = int(real_seq)
+        except (ValueError, TypeError):
+            # 非数字 real_seq:放回 real_seq 让 OneBot 报错,而非静默丢数据
+            params["real_seq"] = real_seq
+            return params
+        mid = self._seq_map.lookup(scope_id, seq_int) if scope_id else None
+        if mid is not None:
+            try:
+                params["message_id"] = int(mid)
+            except (ValueError, TypeError):
+                params["message_id"] = mid
+            logger.debug("seq_map resolved: scope=%s seq=%d -> msg_id=%s", scope_id, seq_int, params["message_id"])
+        else:
+            # 透传:real_seq 当 message_id(go-cqhttp/Lagrange 兼容)
+            params["message_id"] = seq_int
+            logger.debug("seq_map miss: scope=%s seq=%d -> passthrough as message_id", scope_id, seq_int)
+        return params
+
+    async def send_direct_message(self, chat_id: str, message: str, reply_to: str | None = None) -> bool:
+        """Send a message directly via OneBot, bypassing the Hermes plugin."""
+        try:
+            is_group, num_id = parse_chat_id(chat_id)
+            segs: list[dict] = []
+            if reply_to:
+                try:
+                    segs.append(ob.reply_segment(int(reply_to)))
+                except (ValueError, TypeError):
+                    pass
+            segs.append(ob.text_segment(message))
+            if is_group:
+                async with self._send_api_semaphore:
+                    resp = await self._api.send_group_msg(num_id, segs)
+            else:
+                async with self._send_api_semaphore:
+                    resp = await self._api.send_private_msg(num_id, segs)
+            logger.debug(
+                "relay send_direct_message: chat_id=%s ok=True msg_id=%s",
+                chat_id, resp.get("message_id", ""),
+            )
+            return True
+        except Exception:
+            logger.exception("relay send_direct_message failed chat_id=%s", chat_id)
+            return False
+
+    async def send_reject_message(self, chat_id: str, message: str, reply_to: str | None = None) -> bool:
+        """Send an adapter-filter rejection directly to the originating chat."""
+        return await self.send_direct_message(chat_id, message, reply_to)

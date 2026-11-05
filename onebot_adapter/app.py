@@ -1,0 +1,1037 @@
+"""Service composition: builds the aiohttp Applications and lifecycle hooks.
+
+Up to four Applications share service state but bind to separate ports:
+  * onebot_app   -> onebot_reverse_ws_port (OneBot reverse WS endpoint)
+  * hermes_app   -> hermes_ws_port         (Hermes plugin WS endpoint)
+  * webui_app    -> webui_port             (WebUI + REST API + static SPA)
+  * cascade_app  -> cascade_ws_port        (optional leftover-event reverse WS)
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import os
+import signal
+import time
+from collections import deque
+from logging.handlers import BaseRotatingHandler
+from typing import Any
+
+import aiohttp
+import aiohttp.web
+
+from onebot_adapter import __version__
+from onebot_adapter.bind import is_loopback_bind, resolve_bind_hosts, try_port
+from onebot_adapter.bot_blacklist import BotBlacklistStore
+from onebot_adapter.config import (
+    AdapterConfig,
+    ConfigLoadError,
+    ConfigStore,
+    config_path,
+    ensure_tokens,
+    load_config,
+    save_config,
+)
+from onebot_adapter.group_context import GroupContextBuffer
+from onebot_adapter.group_followup import GroupFollowupTracker
+from onebot_adapter.group_history import GroupHistoryReader
+from onebot_adapter.logging_utils import text_summary
+from onebot_adapter.member_preferences import MemberPreferences
+from onebot_adapter.onebot.api import OneBotApi
+from onebot_adapter.onebot.friend_cache import FriendCache
+from onebot_adapter.onebot.handler import OneBotHandler
+from onebot_adapter.onebot.log_format import (
+    detach_preview_logger_handlers,
+    log_dropped_event,
+    sync_preview_logger_handlers,
+)
+from onebot_adapter.onebot.name_resolver import NameResolver
+from onebot_adapter.onebot.seq_map import SeqMap
+from onebot_adapter.onebot.ws_api import WsApiTransport
+from onebot_adapter.onebot.ws_cascade import CascadeWsServer
+from onebot_adapter.onebot.ws_forward import OneBotForwardClient
+from onebot_adapter.onebot.ws_reverse import OneBotReverseServer
+from onebot_adapter.rate_limit import MessageRateLimiter
+from onebot_adapter.relay.hermes_ws import HermesRelayServer
+from onebot_adapter.relay.protocol import FilteredEvent, parse_chat_id
+from onebot_adapter.send_receipts import SendReceipts
+from onebot_adapter.social_chat import SocialChat, policy
+from onebot_adapter.usage_stats import UsageStatsStore
+from onebot_adapter.webui import routes as webui_routes
+
+logger = logging.getLogger(__name__)
+audit_logger = logging.getLogger("onebot_adapter.audit")
+
+
+class _DailySizeRotatingFileHandler(BaseRotatingHandler):
+    """Rotate at the first record of a new day or when the file reaches a size cap."""
+
+    def __init__(self, filename: str, *, max_bytes: int, retention_days: int) -> None:
+        super().__init__(filename, mode="a", encoding="utf-8", delay=True)
+        self.max_bytes = max_bytes
+        self.retention_days = retention_days
+        if os.path.exists(filename):
+            self._current_day = time.strftime("%Y-%m-%d", time.localtime(os.path.getmtime(filename)))
+        else:
+            self._current_day = time.strftime("%Y-%m-%d")
+
+    def shouldRollover(self, record: logging.LogRecord) -> bool:
+        if time.strftime("%Y-%m-%d") != self._current_day:
+            return True
+        if self.stream is None:
+            self.stream = self._open()
+        self.stream.seek(0, os.SEEK_END)
+        rendered = (self.format(record) + self.terminator).encode(self.encoding or "utf-8", errors="replace")
+        return self.stream.tell() + len(rendered) >= self.max_bytes
+
+    def doRollover(self) -> None:
+        if self.stream is not None:
+            self.stream.close()
+            self.stream = None
+        if os.path.exists(self.baseFilename) and os.path.getsize(self.baseFilename):
+            stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+            destination = f"{self.baseFilename}.{stamp}"
+            sequence = 1
+            while os.path.exists(destination):
+                destination = f"{self.baseFilename}.{stamp}.{sequence}"
+                sequence += 1
+            os.replace(self.baseFilename, destination)
+        self._current_day = time.strftime("%Y-%m-%d")
+        cutoff = time.time() - self.retention_days * 86400
+        directory = os.path.dirname(self.baseFilename)
+        prefix = os.path.basename(self.baseFilename) + "."
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            names = []
+        for name in names:
+            path = os.path.join(directory, name)
+            if not name.startswith(prefix):
+                continue
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.unlink(path)
+            except OSError:
+                logger.warning("could not remove expired log file %s", path, exc_info=True)
+
+
+
+
+class AdapterService:
+    def __init__(self, store: ConfigStore | None = None) -> None:
+        self.store = store or ConfigStore(load_config())
+        self._state: dict[str, Any] = {
+            "onebot_connected": False,
+            "hermes_plugin_connected": False,
+            "cascade_ws_connected": False,
+            "log_buffer": deque(maxlen=500),
+            "log_file_enabled": False,
+            "log_file_path": None,
+        }
+        self._api: OneBotApi | None = None
+        self._session: aiohttp.ClientSession | None = None
+        self._ws_api_transport: WsApiTransport | None = None
+        self._onebot_reverse: OneBotReverseServer | None = None
+        self._onebot_forward: OneBotForwardClient | None = None
+        self._cascade: CascadeWsServer | None = None
+        self._relay: HermesRelayServer | None = None
+        self._seq_map: SeqMap | None = None
+        self._runners: list[aiohttp.web.AppRunner] = []
+        self._self_id_probed = False
+        self._file_handler: logging.Handler | None = None
+        self._webui_log_handler: logging.Handler | None = None
+        self._probe_lock = asyncio.Lock()
+        self._cleaning_up = False
+        self._usage_stats: UsageStatsStore | None = None
+        self._bot_blacklist: BotBlacklistStore | None = None
+        self._friend_cache: FriendCache | None = None
+        self._group_history: GroupHistoryReader | None = None
+        self._rate_limiter = MessageRateLimiter()
+        self._rate_notice_at: dict[str, float] = {}
+        self._state["rate_limiter"] = self._rate_limiter
+        self._config_change_lock = asyncio.Lock()
+        self._applied_config = self.store.config
+        self._probe_task: asyncio.Task[None] | None = None
+
+    def _init_components(self) -> None:
+        cfg = self.store.config
+        assert self._session is not None
+        self._ws_api_transport = WsApiTransport(passthrough_timeout=cfg.file_upload_timeout)
+        self._api = OneBotApi(
+            ws_transport=self._ws_api_transport,
+            file_upload_timeout=cfg.file_upload_timeout,
+        )
+        self._state["api"] = self._api
+        self._state["local_api_call"] = self._handle_local_api_call
+        self._name_resolver = NameResolver(self._api)
+        self._api.configure_send_logging(config=cfg, name_resolver=self._name_resolver)
+        self._friend_cache = FriendCache(self._api)
+        self._group_followups = GroupFollowupTracker(cfg.group_auto_reply)
+        self._group_context = GroupContextBuffer(cfg)
+        from onebot_adapter.message_archive import MessageArchive
+        self._message_archive = MessageArchive(config_path().parent / "group_messages.sqlite3")
+        self._group_history = GroupHistoryReader(cfg, self._api, blacklist_match=self._match_bot_blacklist,
+                                                 archive=self._message_archive)
+        self._seq_map = SeqMap(maxlen=cfg.seq_map_size)
+        self._relay = HermesRelayServer(
+            cfg,
+            self._api,
+            adapter_version=__version__,
+            onebot_connected_fn=self._onebot_connected,
+            on_connect=self._on_plugin_connect,
+            on_disconnect=self._update_status,
+            on_dispatch=self._maybe_react_delivered,
+            seq_map=self._seq_map,
+            name_resolver=self._name_resolver,
+            local_api_call=self._handle_local_api_call,
+            group_followups=self._group_followups,
+        )
+        self._state["relay"] = self._relay
+        self._social_chat = SocialChat(
+            cfg, judge=self._relay.request_social_judgment,
+            busy=lambda group: group in self._relay._busy_groups,
+            followups=self._group_followups, blacklist_match=self._match_bot_blacklist,
+            preferences=MemberPreferences(config_path().parent / "member_preferences.sqlite3"),
+            archive=self._message_archive,
+            wakeup_handled=self._relay._wakeup_handled,
+        )
+        self._relay._social_chat = self._social_chat
+        receipt_path = config_path().parent / "send_receipts.sqlite3"
+        self._relay._send_receipts = SendReceipts(receipt_path)
+        self._cascade = CascadeWsServer(
+            cfg,
+            ws_api_transport=self._ws_api_transport,
+            on_connect=self._update_status,
+            on_disconnect=self._update_status,
+        )
+        self._state["cascade"] = self._cascade
+        self._onebot_reverse = OneBotReverseServer(
+            cfg,
+            self._make_onebot_handler("reverse"),
+            on_connect=self._on_onebot_connect,
+            on_disconnect=self._update_status,
+            ws_api_transport=self._ws_api_transport,
+        )
+        self._onebot_forward = OneBotForwardClient(
+            cfg,
+            self._make_onebot_handler("forward"),
+            on_connect=self._on_onebot_connect,
+            on_disconnect=self._update_status,
+            session=self._session,
+            ws_api_transport=self._ws_api_transport,
+        )
+        # Register config-change listener early so hot-reload via the WebUI
+        # (which starts first) notifies components immediately — previously
+        # this was in _on_hermes_startup, which left a window where a config
+        # change before the Hermes WS site started would be silently ignored.
+        self.store.on_change(self._on_config_change)
+
+    def _make_onebot_handler(self, label: str) -> OneBotHandler:
+        assert self._cascade is not None
+        assert self._relay is not None
+        return OneBotHandler(
+            label=label,
+            config=self.store.config,
+            api=self._api,
+            on_event=self._on_onebot_event,
+            on_filtered=self._on_filtered_command,
+            on_dropped=self._cascade.observe_dropped,
+            on_ignored=self._cascade.observe_ignored,
+            is_known_command_fn=self._relay.is_known_command,
+            canonical_command_name_fn=self._relay.canonical_command_name,
+            seq_map=self._seq_map,
+            name_resolver=self._name_resolver,
+            ws_api_transport=self._ws_api_transport,
+            bot_blacklist_match_fn=self._match_bot_blacklist,
+            friend_cache=self._friend_cache,
+            group_followups=self._group_followups,
+            group_context=self._group_context,
+            social_chat=self._social_chat,
+        )
+
+    def _setup_file_logging(self, cfg: AdapterConfig) -> None:
+        """Create or replace the file logging handler for persistent logs.
+
+        The handler is attached to the ``onebot_adapter`` parent logger so
+        that ALL modules under the package (relay, onebot.*, webui, etc.)
+        propagate their log records into ``adapter.log``.  Receive/send
+        *preview* copies use the non-propagating ``message_preview`` logger
+        (console/WebUI only). Persistent message copies go through
+        ``onebot_adapter.file`` according to ``log_file_message_mode``.
+        """
+        if self._file_handler is not None:
+            logging.getLogger("onebot_adapter").removeHandler(self._file_handler)
+            logging.getLogger("onebot_adapter.file").removeHandler(self._file_handler)
+            self._file_handler.close()
+            self._file_handler = None
+
+        file_logger = logging.getLogger("onebot_adapter.file")
+        # Full/persistent message records must never reach root (console/WebUI).
+        file_logger.propagate = False
+        if not cfg.log_file_enabled:
+            self._state["log_file_enabled"] = False
+            self._state["log_file_path"] = None
+            sync_preview_logger_handlers()
+            return
+
+        log_dir = cfg.log_file_dir or os.path.expanduser("~/.onebot_adapter/logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "adapter.log")
+
+        handler = _DailySizeRotatingFileHandler(
+            log_path,
+            max_bytes=cfg.log_file_max_bytes,
+            retention_days=cfg.log_retention_days,
+        )
+        handler.setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"
+        ))
+        logging.getLogger("onebot_adapter").addHandler(handler)
+        file_logger.addHandler(handler)
+        self._file_handler = handler
+        self._state["log_file_enabled"] = True
+        self._state["log_file_path"] = log_path
+        sync_preview_logger_handlers(file_handler=handler)
+
+    def _update_file_logging(self, old: AdapterConfig, new: AdapterConfig) -> None:
+        """Hot-reload file logging settings."""
+        changed = (
+            old.log_file_enabled != new.log_file_enabled
+            or old.log_file_dir != new.log_file_dir
+            or old.log_retention_days != new.log_retention_days
+            or old.log_file_max_bytes != new.log_file_max_bytes
+        )
+        if changed:
+            self._setup_file_logging(new)
+
+    def _apply_log_level(self, level_str: str) -> None:
+        """Apply a log level string (e.g. "DEBUG") to root logger and all
+        owned handlers (WebUI + file).  Called on startup and hot-reload."""
+        level = getattr(logging, level_str.upper(), logging.INFO)
+        logging.getLogger().setLevel(level)
+        if self._webui_log_handler is not None:
+            self._webui_log_handler.setLevel(level)
+        if self._file_handler is not None:
+            self._file_handler.setLevel(level)
+        sync_preview_logger_handlers(file_handler=self._file_handler)
+        logger.info("log level set to %s", level_str.upper())
+
+    def build_onebot_app(self) -> aiohttp.web.Application:
+        assert self._onebot_reverse is not None
+        app = aiohttp.web.Application()
+        self._onebot_reverse.add_routes(app)
+        return app
+
+    def build_hermes_app(self) -> aiohttp.web.Application:
+        assert self._relay is not None
+        app = aiohttp.web.Application()
+        self._relay.add_routes(app)
+        app.on_startup.append(self._on_hermes_startup)
+        app.on_cleanup.append(self._on_hermes_cleanup)
+        return app
+
+    def build_cascade_app(self) -> aiohttp.web.Application:
+        assert self._cascade is not None
+        app = aiohttp.web.Application()
+        self._cascade.add_routes(app)
+        return app
+
+    def _add_optional_runners(
+        self, cfg: AdapterConfig, *, no_webui: bool,
+    ) -> tuple[aiohttp.web.AppRunner | None, aiohttp.web.AppRunner | None]:
+        webui_runner: aiohttp.web.AppRunner | None = None
+        cascade_runner: aiohttp.web.AppRunner | None = None
+        if not no_webui:
+            webui_runner = aiohttp.web.AppRunner(self.build_webui_app())
+            self._runners.append(webui_runner)
+        if cfg.cascade_ws_enabled:
+            cascade_runner = aiohttp.web.AppRunner(self.build_cascade_app())
+            self._runners.append(cascade_runner)
+        return webui_runner, cascade_runner
+
+    def build_webui_app(self) -> aiohttp.web.Application:
+        app = aiohttp.web.Application()
+        webui_routes.add_routes(app, self.store, self._state)
+        return app
+
+    def _onebot_connected(self) -> bool:
+        if self._onebot_reverse and self._onebot_reverse.connected:
+            return True
+        if self._onebot_forward and self._onebot_forward.connected:
+            return True
+        return False
+
+    def _on_onebot_connect(self) -> None:
+        """OneBot WS 连接建立时触发：更新状态并尝试探测 self_id。
+
+        self_id 探测现在依赖 WS 连接（之前走 HTTP API），
+        所以放在每次连接建立时触发，而非启动时盲试。
+        """
+        self._update_status()
+        if not self._self_id_probed and self.store.config.self_id == "":
+            if self._probe_task is None or self._probe_task.done():
+                self._probe_task = asyncio.create_task(self._probe_self_id_guarded())
+
+    async def _probe_self_id_guarded(self) -> None:
+        """Concurrent-safe wrapper: only one probe at a time."""
+        async with self._probe_lock:
+            if self._self_id_probed or self.store.config.self_id != "":
+                return
+            await self._probe_self_id()
+
+    def _update_status(self) -> None:
+        """Synchronise WebUI state with live connection status."""
+        self._state["onebot_connected"] = self._onebot_connected()
+        self._state["hermes_plugin_connected"] = bool(self._relay and self._relay.has_clients)
+        self._state["cascade_ws_connected"] = bool(self._cascade and self._cascade.has_clients)
+
+    def _on_plugin_connect(self) -> None:
+        """Called when the Hermes plugin connects to the relay WS.
+
+        Updates status and materializes channel_prompts into Hermes config.yaml
+        so the plugin picks up the latest global/per-group prompt values.
+        """
+        self._update_status()
+        try:
+            from onebot_adapter.hermes_config import materialize_channel_prompts
+            materialize_channel_prompts(self.store.config, self.store.config.hermes_install_dir or None)
+        except Exception:
+            logger.exception("materialize_channel_prompts on plugin connect failed")
+
+    async def _on_onebot_event(self, event) -> str | None:
+        self._update_status()
+        cfg = self.store.config
+        group_id: str | None = None
+        try:
+            is_group, numeric_id = parse_chat_id(event.chat_id)
+            if is_group:
+                group_id = str(numeric_id)
+        except (TypeError, ValueError):
+            pass
+        if (
+            event.rate_limit_eligible
+            and not cfg.is_admin(event.user_id, group_id)
+        ):
+            decision = await self._rate_limiter.check(
+                cfg,
+                user_id=event.user_id,
+                group_id=group_id,
+            )
+            if not decision.allowed:
+                if event.passive_reply:
+                    return  # never send unsolicited rate-limit errors into a group
+                if decision.reason == "storage_unavailable":
+                    filtered = FilteredEvent(
+                        chat_id=event.chat_id,
+                        chat_type=event.chat_type,
+                        user_id=event.user_id,
+                        user_name=event.user_name,
+                        command_name="",
+                        reject_message="⛔ 限流状态暂不可用，请稍后重试",
+                        message_id=event.message_id,
+                        reply_to_message_id=event.message_id or None,
+                        timestamp=event.timestamp,
+                        filter_type="rate_limit_storage",
+                    )
+                    log_dropped_event(filtered)
+                    await self._on_filtered_command(filtered)
+                    return
+                social_group = group_id is not None and policy(cfg)["enabled"] \
+                    and cfg.get_group_config(group_id).enabled
+                if social_group:
+                    # A rejection is not a model reply or a promise to answer
+                    # later. At most one operational notice per group/minute.
+                    now = time.monotonic()
+                    self._rate_notice_at = {g: t for g, t in self._rate_notice_at.items() if now - t < 60}
+                    if group_id in self._rate_notice_at:
+                        return
+                    self._rate_notice_at[group_id] = now
+                scope_labels = {"global": "全局", "group": "群聊", "user": "个人"}
+                retry_after = max(1, math.ceil(decision.retry_after))
+                message = "限流了，{retry_after} 秒后再试" if social_group else cfg.rate_limit_reject_message
+                replacements = {
+                    "{scope}": scope_labels.get(decision.scope, decision.scope),
+                    "{retry_after}": str(retry_after),
+                    "{user_id}": str(event.user_id),
+                }
+                for placeholder, value in replacements.items():
+                    message = message.replace(placeholder, value)
+                filtered = FilteredEvent(
+                    chat_id=event.chat_id,
+                    chat_type=event.chat_type,
+                    user_id=event.user_id,
+                    user_name=event.user_name,
+                    command_name="",
+                    reject_message=message,
+                    message_id=event.message_id,
+                    reply_to_message_id=event.message_id or None,
+                    timestamp=event.timestamp,
+                    filter_type="rate_limit",
+                )
+                log_dropped_event(filtered)
+                await self._on_filtered_command(filtered)
+                return
+        if self.store.config.usage_stats_enabled and self._usage_stats is not None:
+            try:
+                await self._usage_stats.record(event)
+            except Exception:
+                logger.exception("failed to record usage statistics")
+        logger.debug(
+            "app _on_onebot_event: relaying to Hermes chat_id=%s text=%s",
+            event.chat_id, text_summary(event.text),
+        )
+        if self._relay:
+            outcome = await self._relay.push_event(event)
+            if outcome == "queued":
+                await self._maybe_react_queued(event)
+            elif outcome == "broadcast":
+                await self._maybe_react_delivered(event)
+            # "handled" / "dropped": not delivered to Hermes, so do not react.
+            return outcome
+
+    async def _maybe_react_delivered(self, event) -> None:
+        """消息送达 Hermes(广播或出队)后在原消息上贴表情回应(可配置)。
+
+        触发条件:功能全局开启且当前会话未单独关闭;Hermes 插件有连接(否则
+        消息只进了 ring buffer 等重连重放,不算"送达");event.message_id 可转 int。
+        调用 OneBot ``set_msg_emoji_like`` API,失败仅记 debug 日志,不影响主流程。
+        """
+        await self._do_react(event, self.store.config.reaction_emoji_id)
+
+    async def _maybe_react_queued(self, event) -> None:
+        """消息进入排队队列时在原消息上贴表情回应(可配置)。
+
+        与 _maybe_react_delivered 结构相同,但使用 reaction_emoji_id_queued
+        配置项。当该配置为空字符串时,排队时不贴表情。
+        """
+        emoji_id = self.store.config.reaction_emoji_id_queued
+        if not emoji_id:
+            return
+        await self._do_react(event, emoji_id)
+
+    async def _do_react(self, event, emoji_id: str) -> None:
+        """统一的贴表情回应实现。"""
+        cfg = self.store.config
+        try:
+            is_group, num_id = parse_chat_id(event.chat_id)
+        except (ValueError, TypeError):
+            return
+        group_id = str(num_id) if is_group else None
+        if not cfg.resolve_reaction_emoji_enabled(group_id):
+            return
+        if not self._relay or not self._relay.has_clients:
+            return
+        try:
+            msg_id = int(event.message_id)
+        except (ValueError, TypeError):
+            return
+        assert self._api is not None
+        params: dict[str, Any] = {"message_id": msg_id, "emoji_id": emoji_id}
+        if is_group:
+            params["group_id"] = num_id
+        else:
+            params["user_id"] = num_id
+        try:
+            await self._api.call("set_msg_emoji_like", params)
+            logger.debug(
+                "reaction emoji set: msg=%s emoji=%s chat=%s",
+                event.message_id, emoji_id, event.chat_id,
+            )
+        except Exception:
+            logger.debug(
+                "set_msg_emoji_like failed (msg=%s chat=%s)", event.message_id, event.chat_id
+            )
+
+    async def _on_filtered_command(self, filtered) -> None:
+        """Handle an event denied by an adapter-side filter.
+
+        Sends the reject message back to the originating chat via the OneBot
+        WS API channel (through the relay) and does NOT forward the event to the
+        Hermes plugin.
+        """
+        logger.debug(
+            "app filtered event: type=%s chat_id=%s cmd=%s user=%s",
+            filtered.filter_type, filtered.chat_id, filtered.command_name, filtered.user_id,
+        )
+        if self._relay:
+            await self._relay.send_reject_message(
+                chat_id=filtered.chat_id,
+                message=filtered.reject_message or "⛔ 指令被过滤",
+                reply_to=filtered.reply_to_message_id,
+            )
+
+    def _match_bot_blacklist(self, user_id: str, group_id: str | None):
+        cfg = self.store.config
+        if self._bot_blacklist is None or cfg.is_admin(user_id, group_id):
+            return None
+        return self._bot_blacklist.match(user_id=user_id, group_id=group_id)
+
+    async def _handle_local_api_call(self, action: str, params: dict[str, Any]) -> Any:
+        if action == "adapter_social_turn":
+            return self._social_chat.lookup(str(params.get("group_id", "")), str(params.get("user_id", "")),
+                                            str(params.get("message_id", "")))
+        if action == "adapter_read_current_group_history":
+            if self._group_history is None:
+                raise RuntimeError("当前群记录查询尚未初始化")
+            result = await self._group_history.read(params)
+            if getattr(self, "_social_chat", None) is not None:
+                self._social_chat.history_targets(params, result)
+            return result
+        if action not in {"adapter_get_bot_blacklist", "adapter_edit_bot_blacklist"}:
+            raise ValueError(f"unknown adapter action: {action}")
+        cfg = self.store.config
+        store = self._bot_blacklist
+        if store is None:
+            raise RuntimeError("bot blacklist store unavailable")
+        if not cfg.bot_blacklist_enabled:
+            raise RuntimeError("bot 动态黑名单功能已关闭")
+        if action == "adapter_get_bot_blacklist":
+            entries = store.list(
+                scope=params.get("scope"), group_id=params.get("group_id"), user_id=params.get("user_id"),
+            )
+            return {"entries": [entry.to_dict() for entry in entries], "count": len(entries)}
+
+        operation = str(params.get("operation", ""))
+        scope = str(params.get("scope", ""))
+        user_id = str(params.get("user_id", "")).strip()
+        group_id = str(params.get("group_id", "")).strip()
+        if operation == "remove":
+            removed = store.remove(scope=scope, user_id=user_id, group_id=group_id)
+            audit_logger.info(
+                "bot blacklist entry removed source=agent scope=%s group_id=%s user_id=%s removed=%s",
+                scope, group_id, user_id, removed,
+            )
+            return {"removed": removed, "scope": scope, "group_id": group_id, "user_id": user_id}
+        if operation != "set":
+            raise ValueError("action must be 'set' or 'remove'")
+
+        if cfg.is_admin(user_id, group_id if scope == "group" else None):
+            raise PermissionError("无法拉黑 WebUI 中配置的全局管理员或对应群管理员")
+        try:
+            requested_duration = int(params.get("duration_seconds", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("duration_seconds must be an integer") from exc
+        if requested_duration <= 0:
+            raise ValueError("duration_seconds must be positive")
+        actual_duration = min(requested_duration, cfg.bot_blacklist_max_duration_seconds)
+        entry = store.set(
+            scope=scope,
+            group_id=group_id,
+            user_id=user_id,
+            duration_seconds=actual_duration,
+            reason=str(params.get("reason", "")),
+            created_by_user_id=str(params.get("created_by_user_id", "")),
+        )
+        audit_logger.warning(
+            "bot blacklist entry set source=agent scope=%s group_id=%s user_id=%s duration_seconds=%d "
+            "created_by_user_id=%s",
+            scope, group_id, user_id, actual_duration, str(params.get("created_by_user_id", "")),
+        )
+        result = entry.to_dict()
+        result["requested_duration_seconds"] = requested_duration
+        result["actual_duration_seconds"] = actual_duration
+        result["clamped"] = actual_duration != requested_duration
+        if result["clamped"]:
+            result["notice"] = (
+                f"请求时长 {requested_duration} 秒超过允许上限，已调整为 {actual_duration} 秒"
+            )
+        if scope == "global":
+            exempt_groups = [gid for gid in cfg.groups if user_id in cfg.get_group_config(gid).admins]
+            if exempt_groups:
+                result["exempt_admin_groups"] = exempt_groups
+        return result
+
+    async def _on_hermes_startup(self, app: aiohttp.web.Application) -> None:
+        cfg = self.store.config
+        self._applied_config = cfg
+        logger.info(
+            "OneBot adapter %s | onebot_mode=%s onebot_port=%d hermes_ws_port=%d webui_port=%d "
+            "cascade_enabled=%s cascade_port=%d",
+            __version__, cfg.onebot_mode, cfg.onebot_reverse_ws_port, cfg.hermes_ws_port, cfg.webui_port,
+            cfg.cascade_ws_enabled, cfg.cascade_ws_port,
+        )
+        if cfg.onebot_mode == "forward":
+            assert self._onebot_forward is not None
+            self._onebot_forward.start()
+
+    async def _on_hermes_cleanup(self, app: aiohttp.web.Application) -> None:
+        if self._cleaning_up:
+            return
+        self._cleaning_up = True
+        await self.store.close_notifications()
+        if self._probe_task is not None and not self._probe_task.done():
+            self._probe_task.cancel()
+            await asyncio.gather(self._probe_task, return_exceptions=True)
+        self._probe_task = None
+        if self._onebot_forward:
+            await self._onebot_forward.stop()
+        if self._onebot_reverse:
+            await self._onebot_reverse.stop()
+        if self._cascade:
+            await self._cascade.stop()
+        if self._relay:
+            await self._relay.stop()
+            if self._relay._send_receipts is not None:
+                self._relay._send_receipts.close()
+        if getattr(self, "_social_chat", None) is not None:
+            await self._social_chat.close()
+        if getattr(self, "_message_archive", None) is not None:
+            self._message_archive.close()
+        if self._usage_stats:
+            await self._usage_stats.close()
+            self._usage_stats = None
+            self._state.pop("usage_stats", None)
+        await self._rate_limiter.close()
+        if self._bot_blacklist:
+            self._bot_blacklist.close()
+            self._bot_blacklist = None
+            self._state.pop("bot_blacklist", None)
+        if self._session and not self._session.closed:
+            await self._session.close()
+        for runner in self._runners:
+            await runner.cleanup()
+        logger.info("OneBot adapter stopped")
+        # Detach + close log handlers so the file handle is released and a
+        # subsequent serve() in the same process doesn't double-attach them.
+        detach_preview_logger_handlers()
+        if self._webui_log_handler is not None:
+            logging.getLogger().removeHandler(self._webui_log_handler)
+            self._webui_log_handler.close()
+            self._webui_log_handler = None
+        if self._file_handler is not None:
+            logging.getLogger("onebot_adapter").removeHandler(self._file_handler)
+            logging.getLogger("onebot_adapter.file").removeHandler(self._file_handler)
+            self._file_handler.close()
+            self._file_handler = None
+        self._state["log_file_path"] = None
+        self._state["log_file_enabled"] = False
+
+    async def _on_config_change(self, old: AdapterConfig, new: AdapterConfig) -> None:
+        async with self._config_change_lock:
+            current = self.store.config
+            target = new if current == old else current
+            if target == self._applied_config:
+                return
+            await self._apply_config_change(self._applied_config, target)
+            self._applied_config = target
+
+    def _configure_social(self, config):
+        if getattr(self, "_social_chat", None) is not None:
+            self._social_chat.configure(config)
+
+    async def _apply_config_change(self, old: AdapterConfig, new: AdapterConfig) -> None:
+        """Handle config changes from the WebUI (hot-reload).
+
+        Registered as an async callback — the ConfigStore schedules it via
+        ``asyncio.create_task`` when it fires.
+        """
+        # Always push the fresh config object to every component so that
+        # holders reading config fields at request/connect time see the new
+        # values (hermes_ws_token, onebot_ws_token for WS handshake,
+        # group/DM settings used by the event parser, etc.).
+        if self._group_history is not None:
+            self._group_history.configure(new)
+        self._configure_social(new)
+        if self._relay:
+            self._relay.update_config(new)
+        if self._onebot_reverse:
+            self._onebot_reverse.update_config(new)
+        if self._onebot_forward:
+            self._onebot_forward.update_config(new)
+        if self._cascade:
+            self._cascade.update_config(new)
+        if self._ws_api_transport is not None:
+            self._ws_api_transport.passthrough_timeout = new.file_upload_timeout
+        if self._api:
+            self._api.update_file_upload_timeout(new.file_upload_timeout)
+            self._api.configure_send_logging(config=new, name_resolver=self._name_resolver)
+        if self._seq_map and old.seq_map_size != new.seq_map_size:
+            self._seq_map.update_maxlen(new.seq_map_size)
+            logger.info("SeqMap size changed: %d -> %d", old.seq_map_size, new.seq_map_size)
+        # File logging hot-reload
+        self._update_file_logging(old, new)
+
+        if self._usage_stats and old.usage_stats_retention_days != new.usage_stats_retention_days:
+            await self._usage_stats.update_retention(
+                new.usage_stats_retention_days,
+                prune_now=new.usage_stats_retention_days < old.usage_stats_retention_days,
+            )
+        if self._bot_blacklist and old.bot_blacklist_max_duration_seconds != new.bot_blacklist_max_duration_seconds:
+            clamped = self._bot_blacklist.clamp(new.bot_blacklist_max_duration_seconds)
+            if clamped:
+                logger.info("bot blacklist max duration reduced/clamped entries: %d", clamped)
+
+        # log_level hot-reload: update root logger + WebUI handler + file handler
+        if old.log_level != new.log_level:
+            self._apply_log_level(new.log_level)
+
+        # OneBot mode switch: stop/start forward client.
+        if old.onebot_mode != new.onebot_mode:
+            logger.info("OneBot mode changed: %s -> %s", old.onebot_mode, new.onebot_mode)
+            if old.onebot_mode == "forward" and self._onebot_forward:
+                await self._onebot_forward.stop()
+                logger.info("Forward WS client stopped due to mode switch")
+            if new.onebot_mode == "forward" and self._onebot_forward:
+                self._onebot_forward.start()
+                logger.info("Forward WS client started due to mode switch")
+        elif new.onebot_mode == "forward" and self._onebot_forward:
+            # Mode unchanged but connection-affecting fields changed: force a
+            # reconnect so the new token / forward WS URL takes effect on the
+            # next handshake (the WS handshake token is sent only at connect).
+            conn_changed = (
+                old.onebot_ws_token != new.onebot_ws_token
+                or old.onebot_forward_ws_url != new.onebot_forward_ws_url
+            )
+            if conn_changed:
+                logger.info(
+                    "Forward WS connection params changed; reconnecting "
+                    "(token=%s, url=%s)",
+                    "set" if new.onebot_ws_token else "empty",
+                    new.onebot_forward_ws_url,
+                )
+                await self._onebot_forward.stop()
+                self._onebot_forward.start()
+
+        # Warn about path changes that require a restart to take effect
+        # (routes are bound at startup and can't be hot-swapped).
+        for old_val, new_val, label in [
+            (old.onebot_reverse_ws_path, new.onebot_reverse_ws_path, "onebot_reverse_ws_path"),
+            (old.hermes_ws_path, new.hermes_ws_path, "hermes_ws_path"),
+            (old.cascade_ws_path, new.cascade_ws_path, "cascade_ws_path"),
+            (old.onebot_reverse_ws_port, new.onebot_reverse_ws_port, "onebot_reverse_ws_port"),
+            (old.hermes_ws_port, new.hermes_ws_port, "hermes_ws_port"),
+            (old.webui_port, new.webui_port, "webui_port"),
+            (old.cascade_ws_port, new.cascade_ws_port, "cascade_ws_port"),
+            (old.cascade_ws_enabled, new.cascade_ws_enabled, "cascade_ws_enabled"),
+        ]:
+            if old_val != new_val:
+                logger.warning(
+                    "%s changed (%s -> %s) — requires restart to take effect",
+                    label, old_val, new_val,
+                )
+
+        self._update_status()
+
+    async def _probe_self_id(self) -> None:
+        assert self._api is not None
+        for _ in range(10):
+            try:
+                info = await self._api.get_login_info()
+                new_cfg = self.store.config.with_overrides(self_id=str(info.get("user_id", "")))
+                save_config(
+                    new_cfg,
+                    source="onebot",
+                    reason="onebot.self_id_probe",
+                    actor="adapter_service",
+                    submitted_fields=["self_id"],
+                )
+                self.store.update(new_cfg)
+                self._self_id_probed = True
+                logger.info("OneBot self_id probed: %s", self.store.config.self_id)
+                # Notify already-connected plugins of the new self_id
+                if self._relay:
+                    await self._relay.broadcast_self_id(self.store.config.self_id)
+                return
+            except Exception as exc:
+                logger.debug("self_id probe attempt failed: %s", exc)
+                await asyncio.sleep(3)
+        logger.warning("OneBot self_id probe failed; set it in WebUI")
+
+    async def serve(
+        self,
+        host: str = "127.0.0.1",
+        no_webui: bool = False,
+        *,
+        onebot_host: str | None = None,
+        hermes_host: str | None = None,
+        webui_host: str | None = None,
+        cascade_host: str | None = None,
+    ) -> None:
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            headers={"User-Agent": f"hermes-onebot-adapter/{__version__}"},
+        )
+        cfg = self.store.config
+        # Install handlers before initialising persistent stores/components so
+        # startup failures are visible in both the WebUI buffer and file.
+        if not no_webui:
+            from onebot_adapter.webui.log_handler import attach_log_handler
+            self._webui_log_handler = attach_log_handler(self._state, level=cfg.log_level)
+        sync_preview_logger_handlers()
+        logging.getLogger().setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
+        for noisy in ("aiohttp.access", "aiohttp.web", "aiohttp.server", "aiohttp.websocket", "asyncio"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+        self._setup_file_logging(cfg)
+
+        blacklist_path = config_path().parent / "bot_blacklist.sqlite3"
+        try:
+            self._bot_blacklist = BotBlacklistStore(blacklist_path)
+            self._bot_blacklist.start()
+            self._state["bot_blacklist"] = self._bot_blacklist
+            self._state.pop("bot_blacklist_error", None)
+        except Exception as exc:
+            if self._bot_blacklist is not None:
+                self._bot_blacklist.close()
+            self._bot_blacklist = None
+            self._state["bot_blacklist_error"] = str(exc)
+            logger.exception("bot blacklist unavailable")
+
+        await self._rate_limiter.start(config_path().parent / "rate_limit.sqlite3")
+
+        self._init_components()
+
+        usage_path = config_path().parent / "usage_stats.sqlite3"
+        usage_stats = UsageStatsStore(usage_path, cfg.usage_stats_retention_days)
+        try:
+            await usage_stats.start()
+            self._usage_stats = usage_stats
+            self._state["usage_stats"] = usage_stats
+            self._state.pop("usage_stats_error", None)
+        except Exception as exc:
+            await usage_stats.close()
+            self._usage_stats = None
+            self._state["usage_stats_error"] = str(exc)
+            logger.exception("usage statistics unavailable")
+
+        loop = asyncio.get_running_loop()
+
+        onebot_app = self.build_onebot_app()
+        hermes_app = self.build_hermes_app()
+
+        onebot_runner = aiohttp.web.AppRunner(onebot_app)
+        hermes_runner = aiohttp.web.AppRunner(hermes_app)
+        self._runners = [onebot_runner, hermes_runner]
+        webui_runner, cascade_runner = self._add_optional_runners(cfg, no_webui=no_webui)
+
+        for runner in self._runners:
+            await runner.setup()
+
+        onebot_bind, hermes_bind, webui_bind, cascade_bind = resolve_bind_hosts(
+            host, onebot_host, hermes_host, webui_host, cascade_host,
+        )
+        bindings: list[aiohttp.web.TCPSite] = []
+        runner_label_port = [
+            (onebot_runner, "OneBot WS", onebot_bind, cfg.onebot_reverse_ws_port, "onebot_reverse_ws_port"),
+            (hermes_runner, "Hermes WS", hermes_bind, cfg.hermes_ws_port, "hermes_ws_port"),
+        ]
+        if not no_webui:
+            runner_label_port.append((webui_runner, "WebUI", webui_bind, cfg.webui_port, "webui_port"))
+        if cascade_runner is not None:
+            runner_label_port.append(
+                (cascade_runner, "Cascade WS", cascade_bind, cfg.cascade_ws_port, "cascade_ws_port"),
+            )
+        remapped: dict[str, int] = {}
+        for runner, label, hst, port, cfg_key in runner_label_port:
+            site = await try_port(runner, hst, port, label, 50)
+            bindings.append(site)
+            if site.port != port:
+                logger.warning("%s port %d busy, using %d instead", label, port, site.port)
+                remapped[cfg_key] = site.port
+        if remapped:
+            new_cfg = self.store.config.with_overrides(**remapped)
+            try:
+                save_config(
+                    new_cfg,
+                    source="startup",
+                    reason="port_remap",
+                    actor="adapter_service",
+                    submitted_fields=list(remapped),
+                )
+            except Exception:
+                logger.exception("failed to persist remapped listen ports")
+            else:
+                self.store.update(new_cfg)
+        cfg = self.store.config
+        if not is_loopback_bind(hermes_bind):
+            logger.warning(
+                "Hermes WS is bound to %s (not loopback). "
+                "Prefer --hermes-host 127.0.0.1 unless the plugin is remote.",
+                hermes_bind,
+            )
+        if cascade_runner is not None and not is_loopback_bind(cascade_bind):
+            logger.warning(
+                "Cascade WS is bound to %s (not loopback). "
+                "Prefer --cascade-host 127.0.0.1 unless the downstream bot is remote; "
+                "this port accepts full-privilege OneBot API calls.",
+                cascade_bind,
+            )
+        if not no_webui:
+            logger.info("WebUI ready at http://%s:%d", webui_bind, cfg.webui_port)
+            if not is_loopback_bind(webui_bind):
+                logger.warning(
+                    "WebUI is bound to %s (not loopback). "
+                    "Prefer --webui-host 127.0.0.1 --hermes-host 127.0.0.1; "
+                    "use --onebot-host 0.0.0.0 for remote NapCat.",
+                    webui_bind,
+                )
+
+        stop = asyncio.Event()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except NotImplementedError:
+                pass
+        try:
+            await stop.wait()
+        finally:
+            await self._on_hermes_cleanup(hermes_app)
+
+
+def run(
+    host: str = "127.0.0.1",
+    port: int | None = None,
+    no_webui: bool = False,
+    *,
+    onebot_host: str | None = None,
+    hermes_host: str | None = None,
+    webui_host: str | None = None,
+    cascade_host: str | None = None,
+) -> None:
+    # Bootstrap console logging before configuration I/O so load/generation
+    # failures do not disappear before the configured handlers exist.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    cfg_path = config_path()
+    logger.info("loading config from %s (exists=%s)", cfg_path, cfg_path.exists())
+    try:
+        old_cfg = load_config()
+    except ConfigLoadError as exc:
+        raise SystemExit(str(exc)) from exc
+    webui_token_was_empty = not old_cfg.webui_token
+    cfg = ensure_tokens(old_cfg)
+    from onebot_adapter.config import ensure_config_file_permissions
+    ensure_config_file_permissions()
+    try:
+        errors = cfg.validate()
+    except Exception as exc:
+        raise SystemExit(f"invalid configuration: {exc}") from exc
+    if errors:
+        raise SystemExit("invalid configuration: " + "; ".join(errors))
+    store = ConfigStore(cfg)
+    if port and not no_webui:
+        store.patch(webui_port=port)
+        cfg = store.config
+    logging.getLogger().setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
+    if webui_token_was_empty and not no_webui:
+        logger.info(
+            "WebUI 鉴权 token 已自动生成: %s\n"
+            "    首次登录 WebUI 时需要输入此 token,"
+            "也可在 ~/.onebot_adapter/config.json 的 webui_token 字段查看",
+            cfg.webui_token,
+        )
+    service = AdapterService(store)
+    try:
+        asyncio.run(service.serve(
+            host=host,
+            no_webui=no_webui,
+            onebot_host=onebot_host,
+            hermes_host=hermes_host,
+            webui_host=webui_host,
+            cascade_host=cascade_host,
+        ))
+    except KeyboardInterrupt:
+        pass

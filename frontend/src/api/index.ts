@@ -1,0 +1,467 @@
+import axios from "axios";
+
+const TOKEN_KEY = "hermes_onebot_webui_token";
+
+export function getToken(): string {
+  return localStorage.getItem(TOKEN_KEY) || "";
+}
+
+export function setToken(token: string): void {
+  localStorage.setItem(TOKEN_KEY, token);
+}
+
+export function clearToken(): void {
+  localStorage.removeItem(TOKEN_KEY);
+}
+
+/** Exchange the raw webui_token for a signed session token via POST /api/v1/auth/login.
+ * Uses fetch() directly (not the axios instance) so the 401 response
+ * interceptor does not fire and cause a redirect loop on the login page.
+ * On failure throws an Error with a `.status` property (401 or 429). */
+export async function login(rawToken: string): Promise<number> {
+  const resp = await fetch("/api/v1/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: rawToken }),
+  });
+  if (!resp.ok) {
+    const err = new Error("login failed") as Error & { status: number; body?: any };
+    err.status = resp.status;
+    try { err.body = await resp.json(); } catch {}
+    throw err;
+  }
+  const data = await resp.json();
+  setToken(data.session_token);
+  return data.expires_in as number;
+}
+
+export const api = axios.create({ baseURL: "/api/v1" });
+
+api.interceptors.request.use((config) => {
+  const token = getToken();
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      clearToken();
+      if (window.location.pathname !== "/login") {
+        window.location.href = "/login";
+      }
+    }
+    return Promise.reject(error);
+  },
+);
+
+export interface Status {
+  adapter_version: string;
+  plugin_version: string | null;
+  version_mismatch: boolean;
+  latest_plugin_status: {
+    level: "info" | "warning" | "error";
+    event: string;
+    message: string;
+    timestamp: number;
+  } | null;
+  onebot_connected: boolean;
+  hermes_plugin_connected: boolean;
+  onebot_mode: string;
+  self_id: string;
+  onebot_ws_port: number;
+  hermes_ws_port: number;
+  webui_port: number;
+  cascade_ws_enabled: boolean;
+  cascade_ws_port: number;
+  cascade_ws_connected: boolean;
+  hermes_group_sessions_per_user: boolean;
+}
+
+export interface GroupConfig {
+  group_id: string;
+  name: string;
+  enabled: boolean;
+  require_mention: boolean | null;
+  mention_first_only: boolean | null;
+  trigger_keywords: string[] | null;
+  keyword_first_only: boolean | null;
+  strip_first_mention: boolean | null;
+  custom_prompt: string;
+  admins: string[];
+  group_user_filter_mode: string;
+  group_user_list: string[];
+  message_show_group_id: boolean | null;
+  reaction_emoji_enabled: boolean | null;
+  command_filter_enabled: boolean | null;
+  command_filter_unknown: boolean | null;
+  command_permissions: Record<string, string> | null;
+  outbound_filter_enabled: boolean | null;
+  outbound_filter_patterns: string[] | null;
+  notify_poke_enabled: boolean | null;
+  notify_member_change_enabled: boolean | null;
+  group_rate_limit_algorithm: string | null;
+  group_rate_limit_messages: number | null;
+  group_rate_limit_window_seconds: number | null;
+}
+
+export interface Config {
+  onebot_mode: string;
+  onebot_reverse_ws_port: number;
+  onebot_reverse_ws_path: string;
+  onebot_forward_ws_url: string;
+  onebot_ws_token: string;
+  self_id: string;
+  group_require_mention: boolean;
+  group_mention_first_only: boolean;
+  group_trigger_keywords: string[];
+  group_keyword_first_only: boolean;
+  group_strip_first_mention: boolean;
+  global_admins: string[];
+
+  // ── 私聊设置 ──
+  dm_policy: string;
+  dm_whitelist: string[];
+  dm_blacklist: string[];
+  dm_reject_reply_enabled: boolean;
+  dm_reject_message: string;
+  groups: Record<string, GroupConfig>;
+  global_channel_prompt: string;
+  hermes_ws_port: number;
+  hermes_ws_path: string;
+  hermes_ws_token: string;
+  hermes_install_dir: string;
+  cascade_ws_enabled: boolean;
+  cascade_ws_port: number;
+  cascade_ws_path: string;
+  cascade_ws_token: string;
+  cascade_forward_meta: boolean;
+  hermes_install_allowed_roots: string[];
+  webui_port: number;
+  webui_token?: string;
+  webui_token_lifetime_hours: number;
+  automation_api_enabled: boolean;
+  automation_api_key_configured: boolean;
+  automation_upload_allowed_roots: string[];
+  log_level: string;
+  log_message_preview: number;
+  log_file_enabled: boolean;
+  log_file_dir: string;
+  log_retention_days: number;
+  log_file_message_mode: "none" | "preview" | "full";
+  log_file_max_bytes: number;
+  usage_stats_enabled: boolean;
+  usage_stats_retention_days: number;
+  message_show_group_id: boolean;
+  seq_map_size: number;
+  reaction_emoji_enabled: boolean;
+  reaction_emoji_id: string;
+  reaction_emoji_id_queued: string;
+  file_upload_timeout: number;
+  // ── 发送去重 ──
+  send_dedup_enabled: boolean;
+  send_dedup_ttl_seconds: number;
+  // ── 群聊排队 ──
+  event_queue_enabled: boolean;
+  event_queue_max_per_chat: number;
+  event_queue_idle_timeout: number;
+  event_queue_clear_on_session_reset: boolean;
+  event_queue_clean_command_enabled: boolean;
+  // ── 入站消息限流 ──
+  rate_limit_enabled: boolean;
+  global_rate_limit_algorithm: string;
+  global_rate_limit_messages: number;
+  global_rate_limit_window_seconds: number;
+  group_rate_limit_algorithm: string;
+  group_rate_limit_messages: number;
+  group_rate_limit_window_seconds: number;
+  user_rate_limit_algorithm: string;
+  user_rate_limit_messages: number;
+  user_rate_limit_window_seconds: number;
+  rate_limit_reject_message: string;
+  rate_limit_storage_failure_mode: "memory_fallback" | "reject";
+  // ── 媒体投递 ──
+  media_delivery_mode: string;
+  // ── /指令过滤 ──
+  command_filter_enabled: boolean;
+  command_filter_unknown: boolean;
+  command_permissions: Record<string, string>;
+  command_reject_message: string;
+  // ── 出站消息正则过滤 ──
+  outbound_filter_enabled: boolean;
+  outbound_filter_patterns: string[];
+  // ── Bot 动态用户黑名单 ──
+  bot_blacklist_enabled: boolean;
+  bot_blacklist_max_duration_seconds: number;
+  bot_blacklist_reject_message: string;
+  // ── notice 事件推送 ──
+  notify_poke_enabled: boolean;
+  notify_member_change_enabled: boolean;
+}
+
+export const getStatus = () => api.get<Status>("/status").then((r) => r.data);
+export const getConfig = () => api.get<Config>("/config").then((r) => r.data);
+export const putConfig = (cfg: Partial<Config>) => api.patch<Config>("/config", cfg).then((r) => r.data);
+
+export interface RateLimitPersistenceStatus {
+  status: "not_started" | "healthy" | "degraded" | "recovering";
+  failure_mode: "memory_fallback" | "reject";
+  last_success_at: number | null;
+  pending_operations: number;
+  pending_limit: number;
+  fallback_exhausted: boolean;
+}
+
+export interface RateLimitQuota {
+  scope: "global" | "group" | "user";
+  target_id: string | null;
+  rate_limit_enabled: boolean;
+  scope_enabled: boolean;
+  algorithm: "sliding_window" | "token_bucket";
+  limit: number;
+  window_seconds: number;
+  tracked: boolean;
+  used: number;
+  remaining: number;
+  next_available_in_seconds: number;
+  full_recovery_in_seconds: number;
+  persistence: RateLimitPersistenceStatus;
+  cleared?: boolean;
+  pending_persistence?: boolean;
+}
+
+export const getRateLimitQuota = (scope: string, targetId?: string) =>
+  api.get<RateLimitQuota>("/rate_limit/quota", {
+    params: targetId === undefined ? { scope } : { scope, target_id: targetId },
+  }).then((r) => r.data);
+export const resetRateLimitQuota = (scope: string, targetId?: string) =>
+  api.post<RateLimitQuota>("/rate_limit/quota/reset",
+    targetId === undefined ? { scope } : { scope, target_id: targetId },
+  ).then((r) => r.data);
+export interface HermesDirStatus {
+  hermes_dir: string;
+  exists: boolean;
+}
+
+export const checkHermesDir = () =>
+  api.get<HermesDirStatus>("/hermes_dir_status").then((r) => r.data);
+export const installPlugin = (hermes_install_dir: string) =>
+  api.post("/install_plugin", { hermes_install_dir }).then((r) => r.data);
+export const uninstallPlugin = (hermes_install_dir: string) =>
+  api.post("/uninstall_plugin", { hermes_install_dir }).then((r) => r.data);
+export interface LogsResponse {
+  logs: string[];
+  source: "memory" | "file";
+  memory_limit?: number;
+  file_enabled: boolean;
+  file_available: boolean;
+  file_path: string | null;
+  file_size: number | null;
+  truncated?: boolean;
+  lines?: number;
+}
+
+export const getLogs = () => api.get<LogsResponse>("/logs").then((r) => r.data);
+export const getFileLogs = (lines = 1000) =>
+  api.get<LogsResponse>("/logs/file", { params: { lines } }).then((r) => r.data);
+export async function downloadLogFile(): Promise<void> {
+  const resp = await api.get("/logs/file/download", { responseType: "blob" });
+  const url = URL.createObjectURL(resp.data);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "adapter.log";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+export const getGroups = () => api.get<{ groups: GroupConfig[] }>("/groups").then((r) => r.data.groups);
+export const putGroup = (groupId: string, cfg: Partial<GroupConfig>) =>
+  api.put(`/groups/${groupId}`, cfg).then((r) => r.data);
+export const deleteGroup = (groupId: string) =>
+  api.delete(`/groups/${groupId}`).then((r) => r.data);
+export const syncGroups = () => api.post("/groups/sync").then((r) => r.data);
+
+// ── Usage statistics ──
+
+export interface UsageDimension {
+  id: string;
+  name: string;
+}
+
+export interface UsageStats {
+  enabled: boolean;
+  start: number;
+  end: number;
+  bucket: "hour" | "day";
+  summary: { total: number; active_groups: number; active_users: number };
+  trend: { bucket_start: number; count: number }[];
+  top_groups: (UsageDimension & { count: number })[];
+  top_users: (UsageDimension & { count: number })[];
+}
+
+export interface UsageQuery {
+  start: number;
+  end: number;
+  scope: "all" | "dm" | "group";
+  group_id?: string;
+  user_id?: string;
+  bucket: "hour" | "day";
+  tz_offset_minutes: number;
+}
+
+export const getUsageStats = (params: UsageQuery) =>
+  api.get<UsageStats>("/usage/stats", { params }).then((r) => r.data);
+export const getUsageDimensions = (start: number, end: number) =>
+  api.get<{ groups: UsageDimension[]; users: UsageDimension[] }>("/usage/dimensions", {
+    params: { start, end },
+  }).then((r) => r.data);
+export const clearUsageStats = () =>
+  api.delete<{ ok: boolean; deleted: number }>("/usage").then((r) => r.data);
+
+// ── Bot dynamic blacklist ──
+
+export interface BotBlacklistEntry {
+  id: number;
+  scope: "group" | "dm" | "global";
+  group_id: string;
+  user_id: string;
+  created_at: number;
+  duration_seconds: number;
+  expires_at: number;
+  remaining_seconds: number;
+  remaining: string;
+  reason: string;
+  created_by_user_id: string;
+}
+
+export const getBotBlacklist = () =>
+  api.get<{ entries: BotBlacklistEntry[] }>("/bot_blacklist").then((r) => r.data.entries);
+export const deleteBotBlacklistEntry = (entryId: number) =>
+  api.delete<{ ok: boolean; removed: boolean }>(`/bot_blacklist/${entryId}`).then((r) => r.data);
+
+// ── /command filter ──
+
+export interface CommandInfo {
+  name: string;
+  description: string;
+  source: string;
+  aliases: string[];
+  args_hint: string;
+}
+
+export const getCommands = () =>
+  api.get<{ commands: CommandInfo[] }>("/commands").then((r) => r.data.commands);
+export const refreshCommands = () =>
+  api.post("/commands/refresh").then((r) => r.data);
+
+// ── Hermes tools management (OneBot platform) ──
+
+export interface ToolsetInfo {
+  key: string;
+  label: string;
+  description: string;
+  tools: string[];
+  is_plugin: boolean;
+}
+
+export interface McpServerInfo {
+  name: string;
+  enabled: boolean;
+}
+
+export interface HermesToolsState {
+  configurable: ToolsetInfo[];
+  mcp_servers: McpServerInfo[];
+  current_enabled: string[];
+  hermes_dir_ok: boolean;
+}
+
+export const getHermesTools = () =>
+  api.get<HermesToolsState>("/hermes_tools").then((r) => r.data);
+export const putHermesTools = (payload: {
+  toolsets: string[];
+  mcp_servers: string[];
+  no_mcp: boolean;
+}) => api.put<{ ok: boolean; saved: string[] }>("/hermes_tools", payload).then((r) => r.data);
+export const resetHermesTools = () =>
+  api.post<{ ok: boolean }>("/hermes_tools/reset").then((r) => r.data);
+
+// ── OneBot tool registration and Hermes permission policies ──
+
+export type OneBotToolPermission = "everyone" | "admin";
+
+export interface OneBotToolPolicy {
+  registered: boolean;
+  permission: OneBotToolPermission;
+}
+
+export interface OneBotToolCatalogEntry {
+  name: string;
+  description?: string;
+  schema?: { description?: unknown; [key: string]: unknown };
+  category?: string;
+  scope?: string | string[] | boolean | null;
+  packet?: string | string[] | boolean | null;
+  caveat?: string | string[] | boolean | null;
+  registered?: boolean;
+  permission?: OneBotToolPermission;
+  default_registered?: boolean;
+  default_permission?: OneBotToolPermission;
+  effective?: Partial<OneBotToolPolicy>;
+  effective_policy?: Partial<OneBotToolPolicy>;
+}
+
+export interface OneBotToolPoliciesState {
+  catalog?: OneBotToolCatalogEntry[] | Record<string, OneBotToolCatalogEntry>;
+  tools?: OneBotToolCatalogEntry[] | Record<string, OneBotToolCatalogEntry>;
+  effective?: Record<string, Partial<OneBotToolPolicy>> | Array<Partial<OneBotToolPolicy> & { name: string }>;
+  effective_policies?: Record<string, Partial<OneBotToolPolicy>>;
+  policies?: Record<string, Partial<OneBotToolPolicy>>;
+  sparse_policies?: Record<string, Partial<OneBotToolPolicy>>;
+  restart_required?: boolean;
+}
+
+export const getOneBotToolPolicies = () =>
+  api.get<OneBotToolPoliciesState>("/onebot_tool_policies").then((r) => r.data);
+export const putOneBotToolPolicies = (policies: Record<string, OneBotToolPolicy>) =>
+  api.put<OneBotToolPoliciesState>("/onebot_tool_policies", { policies }).then((r) => r.data);
+export const resetOneBotToolPolicies = () =>
+  api.post<OneBotToolPoliciesState>("/onebot_tool_policies/reset").then((r) => r.data);
+
+// ── Hermes session-isolation mode (group_sessions_per_user) ──
+
+export interface HermesMode {
+  group_sessions_per_user: boolean;
+  source: "plugin_report" | "hermes_config_yaml" | "default";
+  plugin_connected: boolean;
+}
+
+export const getHermesMode = () =>
+  api.get<HermesMode>("/hermes_mode").then((r) => r.data);
+export const putHermesMode = (group_sessions_per_user: boolean) =>
+  api.put<{ ok: boolean; written: boolean; restart_required: boolean; note: string }>(
+    "/hermes_mode", { group_sessions_per_user },
+  ).then((r) => r.data);
+export const refreshHermesMode = () =>
+  api.post<{ ok: boolean; note?: string; error?: string }>("/hermes_mode/refresh").then((r) => r.data);
+
+// ── Version update check ──
+
+export interface UpdateInfo {
+  current_version: string;
+  latest_version: string;
+  has_update: boolean;
+  changelog_url: string;
+}
+
+export const getUpdateCheck = () =>
+  api.get<UpdateInfo>("/update_check").then((r) => r.data);
+
+export const rotateAutomationApiKey = () =>
+  api.post<{ api_key: string; shown_once: boolean }>("/automation/key").then((r) => r.data);
+export const revokeAutomationApiKey = () =>
+  api.delete<{ revoked: boolean }>("/automation/key").then((r) => r.data);

@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="$ROOT/.venv"
+
+bootstrap() {
+  command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
+  if [ ! -x "$VENV/bin/python" ]; then
+    python3 -m venv "$VENV"
+  fi
+  "$VENV/bin/python" -m pip install --disable-pip-version-check -r "$ROOT/requirements.lock"
+  "$VENV/bin/python" -m pip install --disable-pip-version-check --no-deps -e "$ROOT"
+
+  NPM_BIN="$(command -v npm || true)"
+  if [ -z "$NPM_BIN" ]; then
+    for candidate in "$HOME"/.hermes/tools/npm-*/bin/npm; do
+      if [ -x "$candidate" ]; then
+        NPM_BIN="$candidate"
+        break
+      fi
+    done
+    for candidate in "$HOME"/.hermes/tools/node-*/bin/node; do
+      if [ -x "$candidate" ]; then
+        PATH="$(dirname "$candidate"):$PATH"
+        export PATH
+        break
+      fi
+    done
+  fi
+  if [ -n "$NPM_BIN" ]; then
+    (cd "$ROOT/frontend" && "$NPM_BIN" ci && "$NPM_BIN" run build)
+    mkdir -p "$ROOT/onebot_adapter/webui/static"
+    cp -a "$ROOT/frontend/dist/." "$ROOT/onebot_adapter/webui/static/"
+  else
+    echo "note: npm not found; WebUI frontend was not rebuilt" >&2
+  fi
+}
+
+case "${1:-}" in
+  bootstrap)
+    shift
+    bootstrap
+    ;;
+  install)
+    shift
+    bootstrap
+    "$VENV/bin/python" -m kaguya_toolkit.cli install "$@"
+    # Hermes may provide a pinned Node/npm toolchain on hosts that did not
+    # already have one, so make one final idempotent pass to build the WebUI.
+    bootstrap
+    ;;
+  "")
+    echo "usage: ./kaguya {bootstrap|install|init|bind|unbind|napcat|auth|on|off|status|doctor|privacy-check}" >&2
+    exit 2
+    ;;
+  *)
+    [ -x "$VENV/bin/python" ] || { echo "Run ./kaguya bootstrap first" >&2; exit 1; }
+    exec "$VENV/bin/python" -m kaguya_toolkit.cli "$@"
+    ;;
+esac

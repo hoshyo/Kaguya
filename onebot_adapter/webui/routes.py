@@ -1,0 +1,1623 @@
+"""WebUI backend HTTP API + static SPA hosting."""
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import hmac
+import logging
+import math
+import secrets
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+import aiohttp.web
+
+from onebot_adapter import __version__
+from onebot_adapter.config import AdapterConfig, ConfigStore, GroupConfig, save_config
+from onebot_adapter.installer import HermesDirNotAllowed
+from onebot_adapter.rate_limit import RateLimitStorageUnavailable
+from onebot_adapter.webui.tool_api import TOOL_MAP, TOOL_MODELS, add_tool_routes, key_matches
+
+logger = logging.getLogger(__name__)
+audit_logger = logging.getLogger("onebot_adapter.audit")
+
+# Search paths for built SPA assets, checked in order:
+# 1. source-tree static dir (e.g. pip install -e . or editable installs)
+# 2. frontend/dist after manual npm build
+# We deliberately do NOT scan ``sys.path`` for static dirs — that would allow
+# a malicious ``onebot_adapter/webui/static/index.html`` in the current working
+# directory (or an attacker-controlled PYTHONPATH entry) to shadow the real
+# SPA. Only the package's own location and the explicit frontend/dist
+# fallback are trusted.
+_PKG_ROOT = Path(__file__).parent.parent
+_WEBUI_STATIC = Path(__file__).parent / "static"
+_STATIC_CANDIDATES = [
+    _WEBUI_STATIC,
+    _PKG_ROOT.parent / "frontend" / "dist",
+]
+
+
+def _find_static() -> Path | None:
+    for p in _STATIC_CANDIDATES:
+        if (p / "index.html").exists():
+            return p
+    return None
+
+
+_STATIC_DIR = _find_static() or _WEBUI_STATIC
+
+# ── /api/v1/auth/login rate limiting (in-memory, per-IP) ────────────────
+_LOGIN_MAX_FAILS = 5
+_LOGIN_BAN_SECONDS = 900  # 15 minutes
+
+
+def _client_ip(request: aiohttp.web.Request, cfg: AdapterConfig) -> str:
+    """Return a trustworthy client IP using the configured proxy policy."""
+    if cfg.webui_trust_proxy_headers:
+        xff = request.headers.get("X-Forwarded-For", "")
+        if xff.strip():
+            return xff.split(",")[0].strip()
+    return request.remote or "unknown"
+
+
+def _config_request_metadata(request: aiohttp.web.Request, cfg: AdapterConfig) -> dict[str, str]:
+    return {
+        "client_ip": _client_ip(request, cfg),
+        "http_method": request.method,
+        "http_path": request.path,
+    }
+
+
+def add_routes(app: aiohttp.web.Application, store: ConfigStore, state: dict[str, Any]) -> None:
+    app.middlewares.append(_security_middleware)
+    app.middlewares.append(_make_auth_middleware(store))
+    app.router.add_get("/api/v1/health", _health)
+    app.router.add_post("/api/v1/auth/login", _login(store, state))
+    app.router.add_get("/api/v1/openapi.json", _openapi)
+    app.router.add_get("/api/v1/status", _status(store, state))
+    app.router.add_get("/api/v1/config", _get_config(store))
+    app.router.add_patch("/api/v1/config", _put_config(store, state))
+    app.router.add_get("/api/v1/rate_limit/quota", _get_rate_limit_quota(store, state))
+    app.router.add_post("/api/v1/rate_limit/quota/reset", _reset_rate_limit_quota(store, state))
+    app.router.add_post("/api/v1/automation/key", _rotate_automation_key(store))
+    app.router.add_delete("/api/v1/automation/key", _revoke_automation_key(store))
+    app.router.add_get("/api/v1/hermes_dir_status", _hermes_dir_status(store))
+    app.router.add_post("/api/v1/install_plugin", _install_plugin(store, state))
+    app.router.add_post("/api/v1/uninstall_plugin", _uninstall_plugin(store, state))
+    app.router.add_get("/api/v1/logs", _logs(state))
+    app.router.add_get("/api/v1/logs/file", _logs_file(state))
+    app.router.add_get("/api/v1/logs/file/download", _logs_file_download(state))
+    # Group management
+    app.router.add_get("/api/v1/groups", _get_groups(store))
+    app.router.add_put("/api/v1/groups/{group_id}", _put_group(store))
+    app.router.add_delete("/api/v1/groups/{group_id}", _delete_group(store))
+    app.router.add_post("/api/v1/groups/sync", _sync_groups(store, state))
+    # Command filter
+    app.router.add_get("/api/v1/commands", _get_commands(state))
+    app.router.add_post("/api/v1/commands/refresh", _refresh_commands(state))
+    # Hermes tools management (OneBot platform)
+    app.router.add_get("/api/v1/hermes_tools", _get_hermes_tools(store))
+    app.router.add_put("/api/v1/hermes_tools", _put_hermes_tools(store))
+    app.router.add_post("/api/v1/hermes_tools/reset", _reset_hermes_tools(store))
+    app.router.add_get("/api/v1/onebot_tool_policies", _get_onebot_tool_policies(store))
+    app.router.add_put("/api/v1/onebot_tool_policies", _put_onebot_tool_policies(store))
+    app.router.add_post("/api/v1/onebot_tool_policies/reset", _reset_onebot_tool_policies(store))
+    # Hermes session-isolation mode (group_sessions_per_user)
+    app.router.add_get("/api/v1/hermes_mode", _get_hermes_mode(store, state))
+    app.router.add_put("/api/v1/hermes_mode", _put_hermes_mode(store))
+    app.router.add_post("/api/v1/hermes_mode/refresh", _refresh_hermes_mode(state))
+    app.router.add_get("/api/v1/update_check", _update_check)
+    # Usage statistics
+    app.router.add_get("/api/v1/usage/stats", _usage_stats(store, state))
+    app.router.add_get("/api/v1/usage/dimensions", _usage_dimensions(state))
+    app.router.add_delete("/api/v1/usage", _clear_usage(store, state))
+    # Bot-managed dynamic blacklist
+    app.router.add_get("/api/v1/bot_blacklist", _get_bot_blacklist(state))
+    app.router.add_delete("/api/v1/bot_blacklist/{entry_id}", _delete_bot_blacklist(state))
+    add_tool_routes(app, store, state)
+    app.router.add_route("*", "/api/{tail:.*}", _api_not_found)
+    app.router.add_get("/", _index)
+    app.router.add_get("/{tail:.*}", _spa_handler)
+
+
+async def _health(_: aiohttp.web.Request) -> aiohttp.web.Response:
+    return aiohttp.web.json_response({"status": "ok"})
+
+
+@aiohttp.web.middleware
+async def _security_middleware(request: aiohttp.web.Request, handler):
+    request_id = request.headers.get("X-Request-ID", "").strip()[:128] or uuid.uuid4().hex
+    response = await handler(request)
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    if request.path in {
+        "/api/v1/auth/login", "/api/v1/config", "/api/v1/automation/key",
+        "/api/v1/rate_limit/quota", "/api/v1/rate_limit/quota/reset",
+    }:
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+async def _api_not_found(_: aiohttp.web.Request) -> aiohttp.web.Response:
+    return aiohttp.web.json_response(
+        {"error": {"code": "not_found", "message": "API endpoint not found"}}, status=404,
+    )
+
+
+async def _openapi(_: aiohttp.web.Request) -> aiohttp.web.Response:
+    paths: dict[str, Any] = {}
+    for name, (_handler, schema) in TOOL_MAP.items():
+        paths[f"/api/v1/tools/{name}"] = {
+            "post": {
+                "summary": schema["description"],
+                "security": [{"automationApiKey": []}],
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {"schema": TOOL_MODELS[name].model_json_schema()}},
+                },
+                "responses": {"200": {"description": "Tool result"}},
+            },
+        }
+    return aiohttp.web.json_response({
+        "openapi": "3.1.0",
+        "info": {"title": "Hermes OneBot Adapter API", "version": "1"},
+        "paths": paths,
+        "components": {"securitySchemes": {
+            "webuiSession": {"type": "http", "scheme": "bearer"},
+            "automationApiKey": {"type": "http", "scheme": "bearer"},
+        }},
+    })
+
+
+def _login(store: ConfigStore, state: dict[str, Any]):
+    """POST /api/v1/auth/login — exchange the raw webui_token for a signed session token.
+
+    Request body: ``{"token": "<raw webui_token>"}``.
+    Response: ``{"session_token": "<signed token>", "expires_in": <seconds>}``.
+
+    Rate-limited per client IP: after ``_LOGIN_MAX_FAILS`` failed attempts
+    within ``_LOGIN_BAN_SECONDS``, the IP is banned for the remainder of the
+    window and receives ``429 Too Many Requests``. State lives in
+    ``state["login_failures"]`` (in-memory; cleared on restart).
+
+    The client IP is taken from ``X-Forwarded-For`` (first hop) **only** when
+    ``cfg.webui_trust_proxy_headers`` is True — i.e. the adapter is explicitly
+    deployed behind a trusted reverse proxy. Without the flag (default), the
+    direct ``request.remote`` is used; this prevents a non-proxied client from
+    spoofing ``X-Forwarded-For`` to bypass the rate limit.
+    """
+    failures: dict[str, tuple[int, float]] = state.setdefault("login_failures", {})
+
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        # Use X-Forwarded-For only when the user has explicitly opted in via
+        # config; otherwise the direct peer IP is used to prevent spoofing.
+        ip = _client_ip(request, store.config)
+        now = time.time()
+        # Garbage-collect expired entries to keep the dict bounded.
+        # Clear any entry whose ban window has passed, regardless of fail count.
+        for k in list(failures):
+            fails, first_ts = failures[k]
+            if now - first_ts > _LOGIN_BAN_SECONDS:
+                del failures[k]
+        # Check ban
+        entry = failures.get(ip)
+        if entry and entry[0] >= _LOGIN_MAX_FAILS and now - entry[1] < _LOGIN_BAN_SECONDS:
+            retry_after = int(_LOGIN_BAN_SECONDS - (now - entry[1])) + 1
+            audit_logger.warning(
+                "webui login blocked client_ip=%s retry_after=%d", ip, retry_after,
+            )
+            return aiohttp.web.json_response(
+                {"error": "too many attempts", "retry_after": retry_after}, status=429,
+            )
+        try:
+            data = await request.json()
+        except Exception:
+            return aiohttp.web.json_response({"error": "invalid JSON"}, status=400)
+        token = data.get("token", "")
+        if not token:
+            return aiohttp.web.json_response({"error": "token required"}, status=401)
+        cfg = store.config
+        if not cfg.webui_token:
+            return aiohttp.web.json_response(
+                {"error": "webui_token not configured — restart the adapter service to regenerate it"},
+                status=401,
+            )
+        if not _hmac_equal(token, cfg.webui_token):
+            fails, first_ts = failures.get(ip, (0, now))
+            failures[ip] = (fails + 1, first_ts)
+            audit_logger.warning(
+                "webui login failed client_ip=%s failure_count=%d", ip, fails + 1,
+            )
+            return aiohttp.web.json_response({"error": "invalid token"}, status=401)
+        # Success: clear this IP's counter.
+        failures.pop(ip, None)
+        audit_logger.info("webui login succeeded client_ip=%s", ip)
+        issued_at = int(time.time())
+        msg = f"{cfg.webui_token_epoch}:{issued_at}".encode()
+        sig = hmac.new(cfg.webui_token.encode(), msg, hashlib.sha256).hexdigest()
+        payload = f"{issued_at}.{sig}".encode()
+        session_token = base64.urlsafe_b64encode(payload).decode("ascii")
+        return aiohttp.web.json_response({
+            "session_token": session_token,
+            "expires_in": cfg.webui_token_lifetime_hours * 3600,
+        })
+
+    return handler
+
+
+def _hmac_equal(left: str, right: str) -> bool:
+    """Constant-time compare that never raises on length or non-ASCII input."""
+    try:
+        return hmac.compare_digest(left, right)
+    except (TypeError, ValueError):
+        return False
+
+
+def _extract_token(request: aiohttp.web.Request) -> str:
+    """Extract a bearer token exclusively from the Authorization header."""
+    token = request.headers.get("Authorization", "")
+    if token.lower().startswith("bearer "):
+        return token[7:].strip()
+    return ""
+
+
+def _verify_session_token(token: str, secret: str, epoch: int, lifetime_hours: int) -> bool:
+    """Verify an HMAC-signed session token issued by ``/api/v1/auth/login``.
+
+    Token format: ``base64url("{issued_at}.{hmac_hex}")`` where the HMAC is
+    computed over ``f"{epoch}:{issued_at}"`` using *secret* as the key. Returns
+    ``True`` when the signature matches and the token has not expired.
+    """
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode("utf-8")
+        issued_str, sig = raw.split(".", 1)
+        issued_at = int(issued_str)
+    except Exception:
+        return False
+    now = time.time()
+    if now - issued_at > lifetime_hours * 3600:
+        return False
+    # Reject tokens issued too far in the future (clock skew / forgery guard).
+    if issued_at - now > 60:
+        return False
+    msg = f"{epoch}:{issued_at}".encode()
+    expected = hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
+    return _hmac_equal(sig, expected)
+
+
+def _make_auth_middleware(store: ConfigStore):
+    """aiohttp middleware: require a valid signed session token for all /api/* requests.
+
+    ``/api/v1/health``, ``/api/v1/auth/login``, and ``/api/v1/openapi.json``
+    are public. Static-file routes (``/``, ``/{tail:.*}``) are outside ``/api/``
+    and thus unaffected — the SPA shell and login page always load without auth.
+
+    The token must be an HMAC-signed session token issued by ``/api/v1/auth/login``;
+    the raw ``webui_token`` is never accepted by other endpoints.
+    """
+    @aiohttp.web.middleware
+    async def auth_middleware(request: aiohttp.web.Request, handler):
+        public = {"/api/v1/health", "/api/v1/auth/login", "/api/v1/openapi.json"}
+        if request.path.startswith("/api/v1/tools"):
+            cfg = store.config
+            if not cfg.automation_api_enabled:
+                return aiohttp.web.json_response(
+                    {"error": {"code": "automation_api_disabled", "message": "automation API is disabled"}},
+                    status=403,
+                )
+            if not key_matches(_extract_token(request), cfg.automation_api_key_hash):
+                return aiohttp.web.json_response(
+                    {"error": {"code": "unauthorized", "message": "invalid automation API key"}},
+                    status=401,
+                )
+        elif request.path.startswith("/api/") and request.path not in public:
+            token = _extract_token(request)
+            cfg = store.config
+            ok = _verify_session_token(
+                token, cfg.webui_token, cfg.webui_token_epoch, cfg.webui_token_lifetime_hours,
+            )
+            if not ok:
+                audit_logger.warning(
+                    "webui unauthorized request client_ip=%s method=%s path=%s",
+                    _client_ip(request, cfg), request.method, request.path,
+                )
+                return aiohttp.web.json_response({"error": "unauthorized"}, status=401)
+        return await handler(request)
+    return auth_middleware
+
+
+def _status(store: ConfigStore, state: dict[str, Any]):
+    async def handler(_: aiohttp.web.Request) -> aiohttp.web.Response:
+        cfg = store.config
+        relay = state.get("relay")
+        per_user = getattr(relay, "hermes_group_sessions_per_user", True) if relay else True
+        plugin_ver = getattr(relay, "plugin_version", None) if relay else None
+        mismatch = getattr(relay, "version_mismatch", True) if relay else True
+        plugin_status = getattr(relay, "latest_plugin_status", None) if relay else None
+        return aiohttp.web.json_response(
+            {
+                "adapter_version": __version__,
+                "plugin_version": plugin_ver,
+                "version_mismatch": mismatch,
+                "latest_plugin_status": plugin_status,
+                "social_chat": getattr(relay, "social_status", None) if relay else None,
+                "onebot_connected": bool(state.get("onebot_connected")),
+                "hermes_plugin_connected": bool(state.get("hermes_plugin_connected")),
+                "onebot_mode": cfg.onebot_mode,
+                "self_id": cfg.self_id,
+                "onebot_ws_port": cfg.onebot_reverse_ws_port,
+                "hermes_ws_port": cfg.hermes_ws_port,
+                "webui_port": cfg.webui_port,
+                "cascade_ws_enabled": cfg.cascade_ws_enabled,
+                "cascade_ws_port": cfg.cascade_ws_port,
+                "cascade_ws_connected": bool(state.get("cascade_ws_connected")),
+                "hermes_group_sessions_per_user": per_user,
+            }
+        )
+
+    return handler
+
+
+def _hermes_dir_status(store: ConfigStore):
+    async def handler(_: aiohttp.web.Request) -> aiohttp.web.Response:
+        from onebot_adapter.installer import _resolve_hermes_dir
+
+        cfg = store.config
+        extra_roots = list(cfg.hermes_install_allowed_roots)
+        try:
+            from onebot_adapter.installer import validate_hermes_dir
+            hermes_dir = _resolve_hermes_dir(cfg.hermes_install_dir or None)
+            err = validate_hermes_dir(hermes_dir, extra_roots)
+            if err:
+                return aiohttp.web.json_response(
+                    {"hermes_dir": str(hermes_dir), "exists": False, "error": err},
+                    status=400,
+                )
+        except Exception as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        return aiohttp.web.json_response(
+            {
+                "hermes_dir": str(hermes_dir),
+                "exists": hermes_dir.exists(),
+            }
+        )
+
+    return handler
+
+
+def _hermes_roots(cfg: AdapterConfig) -> list[str]:
+    return list(cfg.hermes_install_allowed_roots)
+
+
+def _hermes_config_or_error(cfg: AdapterConfig) -> tuple[Path | None, aiohttp.web.Response | None]:
+    from onebot_adapter.hermes_config import resolve_hermes_config_path
+
+    try:
+        path = resolve_hermes_config_path(
+            cfg.hermes_install_dir or None, extra_roots=_hermes_roots(cfg),
+        )
+    except HermesDirNotAllowed as exc:
+        return None, aiohttp.web.json_response({"error": str(exc)}, status=400)
+    if path is None:
+        return None, aiohttp.web.json_response(
+            {"error": "hermes_install_dir 未配置或目录不存在,请先在插件管理页配置"},
+            status=400,
+        )
+    return path, None
+
+
+def _public_config(cfg: AdapterConfig) -> dict[str, Any]:
+    """Config dict with the raw ``webui_token`` scrubbed for API responses.
+
+    The WebUI login token is the password to this very UI and must never be
+    readable over the API — verify it through ``POST /api/v1/auth/login`` instead.
+    Other tokens (onebot_ws_token, hermes_ws_token) are operational values
+    the user needs to see/copy in the WebUI and are returned as-is.
+
+    ``webui_token_epoch`` is internal state used for session invalidation
+    and must not be exposed or client-settable; it is stripped here and in
+    ``_put_config`` so a PATCH body cannot override the internally-bumped value.
+    """
+    d = cfg.to_dict()
+    d.pop("webui_token", None)
+    d.pop("webui_token_epoch", None)
+    d.pop("automation_api_key_hash", None)
+    d["automation_api_key_configured"] = bool(cfg.automation_api_key_hash)
+    return d
+
+
+def _get_config(store: ConfigStore):
+    async def handler(_: aiohttp.web.Request) -> aiohttp.web.Response:
+        return aiohttp.web.json_response(_public_config(store.config))
+
+    return handler
+
+
+def _rate_limit_target(scope: Any, target_id: Any, *, target_supplied: bool) -> tuple[str, str | None]:
+    if scope not in {"global", "group", "user"}:
+        raise ValueError("scope must be global, group, or user")
+    if scope == "global":
+        if target_supplied:
+            raise ValueError("target_id must not be supplied for global scope")
+        return scope, None
+    if not isinstance(target_id, str) or not target_id.strip().isdigit():
+        raise ValueError("target_id must be a numeric string for group or user scope")
+    return scope, target_id.strip()
+
+
+def _get_rate_limit_quota(store: ConfigStore, state: dict[str, Any]):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        try:
+            scope, target_id = _rate_limit_target(
+                request.query.get("scope"), request.query.get("target_id"),
+                target_supplied="target_id" in request.query,
+            )
+        except ValueError as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        limiter = state.get("rate_limiter")
+        if limiter is None:
+            return aiohttp.web.json_response({"error": "rate limiter unavailable"}, status=503)
+        result = await limiter.quota(store.config, scope, target_id)
+        return aiohttp.web.json_response(result)
+
+    return handler
+
+
+def _reset_rate_limit_quota(store: ConfigStore, state: dict[str, Any]):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return aiohttp.web.json_response({"error": "invalid JSON"}, status=400)
+        if not isinstance(data, dict):
+            return aiohttp.web.json_response({"error": "JSON body must be an object"}, status=400)
+        try:
+            scope, target_id = _rate_limit_target(
+                data.get("scope"), data.get("target_id"), target_supplied="target_id" in data,
+            )
+        except ValueError as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        limiter = state.get("rate_limiter")
+        if limiter is None:
+            return aiohttp.web.json_response({"error": "rate limiter unavailable"}, status=503)
+        try:
+            result = await limiter.reset(store.config, scope, target_id)
+        except RateLimitStorageUnavailable:
+            return aiohttp.web.json_response(
+                {"error": "rate-limit persistence backlog is full"}, status=503,
+            )
+        audit_logger.warning(
+            "rate-limit quota reset source=webui scope=%s target_id=%s cleared=%s pending=%s client_ip=%s",
+            scope, target_id or "", result["cleared"], result["pending_persistence"],
+            _client_ip(request, store.config),
+        )
+        return aiohttp.web.json_response(result)
+
+    return handler
+
+
+def _rotate_automation_key(store: ConfigStore):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        raw_key = "hoa_" + secrets.token_urlsafe(32)
+        new_cfg = store.config.with_overrides(
+            automation_api_key_hash=hashlib.sha256(raw_key.encode()).hexdigest(),
+        )
+        try:
+            save_config(
+                new_cfg, source="webui", reason="automation.key.rotate",
+                actor="authenticated_webui_session",
+                metadata=_config_request_metadata(request, store.config),
+                submitted_fields=["automation_api_key_hash"],
+            )
+        except Exception:
+            logger.exception("automation API key save failed")
+            return aiohttp.web.json_response(
+                {"error": {"code": "config_save_failed", "message": "failed to save API key"}}, status=500,
+            )
+        store.update(new_cfg)
+        return aiohttp.web.json_response({"api_key": raw_key, "shown_once": True})
+
+    return handler
+
+
+def _revoke_automation_key(store: ConfigStore):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        new_cfg = store.config.with_overrides(
+            automation_api_key_hash="", automation_api_enabled=False,
+        )
+        try:
+            save_config(
+                new_cfg, source="webui", reason="automation.key.revoke",
+                actor="authenticated_webui_session",
+                metadata=_config_request_metadata(request, store.config),
+                submitted_fields=["automation_api_key_hash", "automation_api_enabled"],
+            )
+        except Exception:
+            logger.exception("automation API key revoke failed")
+            return aiohttp.web.json_response(
+                {"error": {"code": "config_save_failed", "message": "failed to revoke API key"}}, status=500,
+            )
+        store.update(new_cfg)
+        return aiohttp.web.json_response({"revoked": True})
+
+    return handler
+
+
+def _get_bot_blacklist(state: dict[str, Any]):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        blacklist = state.get("bot_blacklist")
+        if blacklist is None:
+            return aiohttp.web.json_response(
+                {"error": state.get("bot_blacklist_error", "bot blacklist unavailable")}, status=503,
+            )
+        try:
+            entries = blacklist.list(
+                scope=request.query.get("scope"),
+                group_id=request.query.get("group_id"),
+                user_id=request.query.get("user_id"),
+            )
+        except ValueError as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        return aiohttp.web.json_response({"entries": [entry.to_dict() for entry in entries]})
+
+    return handler
+
+
+def _delete_bot_blacklist(state: dict[str, Any]):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        blacklist = state.get("bot_blacklist")
+        if blacklist is None:
+            return aiohttp.web.json_response(
+                {"error": state.get("bot_blacklist_error", "bot blacklist unavailable")}, status=503,
+            )
+        try:
+            entry_id = int(request.match_info["entry_id"])
+        except (TypeError, ValueError):
+            return aiohttp.web.json_response({"error": "invalid entry_id"}, status=400)
+        removed = blacklist.remove_id(entry_id)
+        if not removed:
+            return aiohttp.web.json_response({"error": "entry not found"}, status=404)
+        audit_logger.info(
+            "bot blacklist entry removed source=webui entry_id=%d client_ip=%s",
+            entry_id, request.remote or "unknown",
+        )
+        return aiohttp.web.json_response({"ok": True, "removed": True})
+
+    return handler
+
+
+def _put_config(store: ConfigStore, state: dict[str, Any]):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return aiohttp.web.json_response({"error": "invalid JSON"}, status=400)
+        try:
+            # Bump the token epoch when the lifetime changes so that every
+            # already-issued HMAC session token becomes invalid immediately.
+            # Strip client-supplied epoch first so a PATCH body can't override
+            # the internal counter (see _public_config for rationale).
+            data.pop("webui_token_epoch", None)
+            data.pop("automation_api_key_hash", None)
+            data.pop("automation_api_key_configured", None)
+            if "webui_token_lifetime_hours" in data and \
+                    data["webui_token_lifetime_hours"] != store.config.webui_token_lifetime_hours:
+                data["webui_token_epoch"] = store.config.webui_token_epoch + 1
+            new_cfg = AdapterConfig.from_dict({**store.config.to_dict(), **data})
+            if "webui_token" in data and (not new_cfg.webui_token or len(new_cfg.webui_token) < 8):
+                return aiohttp.web.json_response(
+                    {"error": "webui_token must be at least 8 characters"}, status=400,
+                )
+            errors = new_cfg.validate()
+            if errors:
+                return aiohttp.web.json_response({"error": "; ".join(errors)}, status=400)
+            # Persist to disk first so that a save failure doesn't leave
+            # in-memory state diverged from on-disk state (listeners would
+            # have already applied the new config but the file would be stale).
+            try:
+                save_config(
+                    new_cfg,
+                    source="webui",
+                    reason="webui.config_patch",
+                    actor="authenticated_webui_session",
+                    metadata=_config_request_metadata(request, store.config),
+                    submitted_fields=list(data),
+                )
+            except Exception as exc:
+                return aiohttp.web.json_response({"error": f"failed to save config: {exc}"}, status=500)
+            store.update(new_cfg)
+            # Materialize channel_prompts into Hermes config.yaml so the plugin
+            # picks up the new global_channel_prompt on next connect/restart.
+            try:
+                from onebot_adapter.hermes_config import materialize_channel_prompts
+                materialize_channel_prompts(new_cfg, new_cfg.hermes_install_dir or None)
+            except Exception:
+                logger.exception("materialize_channel_prompts after config save failed")
+        except Exception as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=500)
+        return aiohttp.web.json_response(_public_config(new_cfg))
+
+    return handler
+
+
+def _usage_range(request: aiohttp.web.Request) -> tuple[float, float]:
+    """Parse an optional half-open Unix timestamp range (default: last 7 days)."""
+    now = time.time()
+    try:
+        start = float(request.query.get("start", now - 7 * 86400))
+        end = float(request.query.get("end", now))
+    except (TypeError, ValueError) as exc:
+        raise aiohttp.web.HTTPBadRequest(text='{"error":"start and end must be Unix timestamps"}',
+                                         content_type="application/json") from exc
+    if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+        raise aiohttp.web.HTTPBadRequest(text='{"error":"end must be greater than start"}',
+                                         content_type="application/json")
+    return start, end
+
+
+def _usage_stats(store: ConfigStore, state: dict[str, Any]):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        usage = state.get("usage_stats")
+        if usage is None:
+            return aiohttp.web.json_response(
+                {"error": state.get("usage_stats_error", "usage statistics unavailable")}, status=503,
+            )
+        start, end = _usage_range(request)
+        scope = request.query.get("scope", "all")
+        bucket = request.query.get("bucket", "day")
+        group_id = request.query.get("group_id") or None
+        user_id = request.query.get("user_id") or None
+        if scope not in {"all", "dm", "group"}:
+            return aiohttp.web.json_response({"error": "scope must be all, dm, or group"}, status=400)
+        if bucket not in {"hour", "day"}:
+            return aiohttp.web.json_response({"error": "bucket must be hour or day"}, status=400)
+        if scope == "dm" and group_id is not None:
+            return aiohttp.web.json_response({"error": "group_id cannot be used with dm scope"}, status=400)
+        try:
+            tz_offset = int(request.query.get("tz_offset_minutes", "0"))
+        except ValueError:
+            return aiohttp.web.json_response({"error": "tz_offset_minutes must be an integer"}, status=400)
+        if not -1440 <= tz_offset <= 1440:
+            return aiohttp.web.json_response({"error": "tz_offset_minutes out of range"}, status=400)
+        try:
+            result = await usage.query(
+                start=start,
+                end=end,
+                scope=scope,
+                group_id=group_id,
+                user_id=user_id,
+                bucket=bucket,
+                tz_offset_minutes=tz_offset,
+            )
+        except Exception as exc:
+            logger.exception("usage statistics query failed")
+            return aiohttp.web.json_response({"error": str(exc)}, status=503)
+        return aiohttp.web.json_response({
+            "enabled": store.config.usage_stats_enabled,
+            "start": start,
+            "end": end,
+            "bucket": bucket,
+            **result,
+        })
+
+    return handler
+
+
+def _usage_dimensions(state: dict[str, Any]):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        usage = state.get("usage_stats")
+        if usage is None:
+            return aiohttp.web.json_response(
+                {"error": state.get("usage_stats_error", "usage statistics unavailable")}, status=503,
+            )
+        start, end = _usage_range(request)
+        try:
+            result = await usage.dimensions(start, end)
+        except Exception as exc:
+            logger.exception("usage dimensions query failed")
+            return aiohttp.web.json_response({"error": str(exc)}, status=503)
+        return aiohttp.web.json_response(result)
+
+    return handler
+
+
+def _clear_usage(store: ConfigStore, state: dict[str, Any]):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        usage = state.get("usage_stats")
+        if usage is None:
+            return aiohttp.web.json_response(
+                {"error": state.get("usage_stats_error", "usage statistics unavailable")}, status=503,
+            )
+        try:
+            deleted = await usage.clear()
+        except Exception as exc:
+            logger.exception("clearing usage statistics failed")
+            return aiohttp.web.json_response({"error": str(exc)}, status=503)
+        audit_logger.warning(
+            "usage statistics cleared deleted=%d client_ip=%s",
+            deleted, _client_ip(request, store.config),
+        )
+        return aiohttp.web.json_response({"ok": True, "deleted": deleted})
+
+    return handler
+
+
+def _install_plugin(store: ConfigStore, state: dict[str, Any]):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return aiohttp.web.json_response({"error": "invalid JSON"}, status=400)
+        install_dir = data.get("hermes_install_dir")
+        cfg = store.config
+        from onebot_adapter.installer import _resolve_hermes_dir
+
+        target = _resolve_hermes_dir(install_dir)
+        adapter_url = f"ws://127.0.0.1:{cfg.hermes_ws_port}{cfg.hermes_ws_path}"
+        adapter_token = cfg.hermes_ws_token
+        from onebot_adapter import installer
+
+        try:
+            result = await asyncio.to_thread(
+                installer.install,
+                str(target),
+                adapter_url=adapter_url,
+                adapter_token=adapter_token,
+                extra_roots=cfg.hermes_install_allowed_roots,
+            )
+            if result.get("error"):
+                status = 400 if "outside allowed Hermes roots" in str(result["error"]) else 500
+                return aiohttp.web.json_response(result, status=status)
+            # Persist the install dir so subsequent toolset reads / uninstalls
+            # use the same path without the user re-entering it in the config page.
+            if install_dir and str(target) != cfg.hermes_install_dir:
+                new_cfg = store.config.with_overrides(hermes_install_dir=str(target))
+                errors = new_cfg.validate()
+                if errors:
+                    return aiohttp.web.json_response({"error": "; ".join(errors)}, status=400)
+                save_config(
+                    new_cfg,
+                    source="webui",
+                    reason="plugin.install.persist_directory",
+                    actor="authenticated_webui_session",
+                    metadata=_config_request_metadata(request, cfg),
+                    submitted_fields=["hermes_install_dir"],
+                )
+                store.update(new_cfg)
+            return aiohttp.web.json_response(result)
+        except Exception as exc:
+            logger.exception("plugin install failed")
+            return aiohttp.web.json_response({"error": str(exc)}, status=500)
+
+    return handler
+
+
+def _uninstall_plugin(store: ConfigStore, state: dict[str, Any]):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return aiohttp.web.json_response({"error": "invalid JSON"}, status=400)
+        install_dir = data.get("hermes_install_dir")
+        from onebot_adapter.installer import _resolve_hermes_dir
+
+        target = _resolve_hermes_dir(install_dir)
+        from onebot_adapter import installer
+
+        try:
+            result = await asyncio.to_thread(
+                installer.uninstall, str(target), extra_roots=store.config.hermes_install_allowed_roots,
+            )
+            if result.get("error"):
+                status = 400 if "outside allowed Hermes roots" in str(result["error"]) else 500
+                return aiohttp.web.json_response(result, status=status)
+            # Persist the resolved install dir so the config reflects where
+            # the plugin was managed, matching _install_plugin's behavior.
+            if install_dir and str(target) != store.config.hermes_install_dir:
+                new_cfg = store.config.with_overrides(hermes_install_dir=str(target))
+                errors = new_cfg.validate()
+                if errors:
+                    return aiohttp.web.json_response({"error": "; ".join(errors)}, status=400)
+                save_config(
+                    new_cfg,
+                    source="webui",
+                    reason="plugin.uninstall.persist_directory",
+                    actor="authenticated_webui_session",
+                    metadata=_config_request_metadata(request, store.config),
+                    submitted_fields=["hermes_install_dir"],
+                )
+                store.update(new_cfg)
+            return aiohttp.web.json_response(result)
+        except Exception as exc:
+            logger.exception("plugin uninstall failed")
+            return aiohttp.web.json_response({"error": str(exc)}, status=500)
+
+    return handler
+
+
+_MEMORY_LOG_LIMIT = 500
+_LOG_FILE_TAIL_DEFAULT = 1000
+_LOG_FILE_TAIL_MAX = 5000
+_LOG_FILE_TAIL_MAX_BYTES = 1 * 1024 * 1024
+
+
+def _log_file_status(state: dict[str, Any]) -> dict[str, Any]:
+    enabled = bool(state.get("log_file_enabled"))
+    path = state.get("log_file_path")
+    available = bool(enabled and isinstance(path, str) and path and Path(path).is_file())
+    size = Path(path).stat().st_size if available else None
+    return {
+        "file_enabled": enabled,
+        "file_available": available,
+        "file_path": path if enabled else None,
+        "file_size": size,
+    }
+
+
+def _tail_log_file(path: str, max_lines: int) -> tuple[list[str], bool]:
+    """Return the last *max_lines* of *path* and whether the read was truncated."""
+    file_path = Path(path)
+    size = file_path.stat().st_size
+    truncated = size > _LOG_FILE_TAIL_MAX_BYTES
+    with file_path.open("rb") as handle:
+        if truncated:
+            handle.seek(size - _LOG_FILE_TAIL_MAX_BYTES)
+        data = handle.read().decode("utf-8", errors="replace")
+    lines = data.splitlines()
+    if truncated and lines:
+        lines = lines[1:]
+    if len(lines) > max_lines:
+        return lines[-max_lines:], True
+    return lines, truncated
+
+
+def _logs(state: dict[str, Any]):
+    async def handler(_: aiohttp.web.Request) -> aiohttp.web.Response:
+        records = list(state.get("log_buffer", []))
+        payload = {
+            "logs": records,
+            "source": "memory",
+            "memory_limit": _MEMORY_LOG_LIMIT,
+            **_log_file_status(state),
+        }
+        return aiohttp.web.json_response(payload)
+
+    return handler
+
+
+def _logs_file(state: dict[str, Any]):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        status = _log_file_status(state)
+        raw_lines = request.query.get("lines", str(_LOG_FILE_TAIL_DEFAULT))
+        try:
+            max_lines = int(raw_lines)
+        except (TypeError, ValueError):
+            max_lines = _LOG_FILE_TAIL_DEFAULT
+        max_lines = max(1, min(max_lines, _LOG_FILE_TAIL_MAX))
+        if not status["file_available"]:
+            return aiohttp.web.json_response({
+                "logs": [],
+                "source": "file",
+                "truncated": False,
+                "lines": max_lines,
+                **status,
+            })
+        try:
+            records, truncated = _tail_log_file(str(status["file_path"]), max_lines)
+        except OSError as exc:
+            logger.warning("failed to read log file %s: %s", status["file_path"], exc)
+            return aiohttp.web.json_response(
+                {"error": "failed to read log file"}, status=500,
+            )
+        return aiohttp.web.json_response({
+            "logs": records,
+            "source": "file",
+            "truncated": truncated,
+            "lines": max_lines,
+            **status,
+        })
+
+    return handler
+
+
+def _logs_file_download(state: dict[str, Any]):
+    async def handler(_: aiohttp.web.Request) -> aiohttp.web.Response:
+        status = _log_file_status(state)
+        if not status["file_available"]:
+            return aiohttp.web.json_response(
+                {"error": "file logging disabled or log file missing"}, status=404,
+            )
+        return aiohttp.web.FileResponse(
+            path=str(status["file_path"]),
+            headers={"Content-Disposition": 'attachment; filename="adapter.log"'},
+        )
+
+    return handler
+
+
+# ── Command filter ───────────────────────────────────────────────────────
+
+
+def _get_commands(state: dict[str, Any]):
+    async def handler(_: aiohttp.web.Request) -> aiohttp.web.Response:
+        relay = state.get("relay")
+        commands: list[dict[str, Any]] = []
+        if relay is not None:
+            commands = relay.commands  # type: ignore[attr-defined]
+        return aiohttp.web.json_response({"commands": commands})
+
+    return handler
+
+
+def _refresh_commands(state: dict[str, Any]):
+    async def handler(_: aiohttp.web.Request) -> aiohttp.web.Response:
+        relay = state.get("relay")
+        if relay is None:
+            return aiohttp.web.json_response({"error": "relay not ready"}, status=503)
+        # Ask each connected Hermes plugin client to re-push a snapshot.
+        try:
+            await relay.broadcast_commands_refresh()  # type: ignore[attr-defined]
+        except Exception as exc:
+            logger.exception("commands refresh failed")
+            return aiohttp.web.json_response({"error": str(exc)}, status=500)
+        return aiohttp.web.json_response({"sent": True})
+
+    return handler
+
+
+# ── Group management ─────────────────────────────────────────────────────
+
+
+def _get_groups(store: ConfigStore):
+    async def handler(_: aiohttp.web.Request) -> aiohttp.web.Response:
+        cfg = store.config
+        groups = []
+        for _gid, raw in cfg.groups.items():
+            gc = GroupConfig.from_dict(raw)
+            groups.append(gc.to_dict())
+        return aiohttp.web.json_response({"groups": groups})
+
+    return handler
+
+
+def _coerce_group_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """Coerce WebUI-supplied group fields to their expected types.
+
+    The existing ``GroupConfig.from_dict`` drops unknown keys but doesn't
+    type-check known ones. A WebUI bug or malicious payload could push
+    ``admins: "123"`` (string) instead of ``["123"]`` (list), which would
+    crash ``is_admin()`` at lookup time. This function coerces list fields
+    to lists of strings and ``command_permissions`` to a str→str dict.
+    """
+    for list_field in ("admins", "trigger_keywords", "group_user_list", "outbound_filter_patterns"):
+        val = data.get(list_field)
+        if val is not None and not isinstance(val, list):
+            data[list_field] = [str(val)]
+    # Coerce command_permissions values to strings
+    cp = data.get("command_permissions")
+    if cp is not None and isinstance(cp, dict):
+        data["command_permissions"] = {str(k): str(v) for k, v in cp.items()}
+    return data
+
+
+def _put_group(store: ConfigStore):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        group_id = request.match_info.get("group_id", "")
+        if not group_id:
+            return aiohttp.web.json_response({"error": "group_id required"}, status=400)
+        try:
+            data = await request.json()
+        except Exception:
+            return aiohttp.web.json_response({"error": "invalid JSON"}, status=400)
+        data = _coerce_group_fields(data)
+        gc = GroupConfig.from_dict({**data, "group_id": str(group_id)})
+        cfg = store.config
+        new_groups = {**cfg.groups, str(group_id): gc.to_dict()}
+        try:
+            new_cfg = cfg.with_overrides(groups=new_groups)
+            errors = new_cfg.validate()
+            if errors:
+                raise ValueError("; ".join(errors))
+        except ValueError as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        metadata = _config_request_metadata(request, cfg)
+        metadata["group_id"] = str(group_id)
+        save_config(
+            new_cfg,
+            source="webui",
+            reason="group.update",
+            actor="authenticated_webui_session",
+            metadata=metadata,
+            submitted_fields=["groups"],
+        )
+        store.update(new_cfg)
+        # Materialize channel_prompts into Hermes config.yaml so the plugin
+        # picks up the new per-group custom_prompt on next connect/restart.
+        try:
+            from onebot_adapter.hermes_config import materialize_channel_prompts
+            materialize_channel_prompts(new_cfg, new_cfg.hermes_install_dir or None)
+        except Exception:
+            logger.exception("materialize_channel_prompts after group save failed")
+        return aiohttp.web.json_response(gc.to_dict())
+
+    return handler
+
+
+def _delete_group(store: ConfigStore):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        group_id = request.match_info.get("group_id", "")
+        cfg = store.config
+        new_groups = {k: v for k, v in cfg.groups.items() if k != str(group_id)}
+        new_cfg = cfg.with_overrides(groups=new_groups)
+        metadata = _config_request_metadata(request, cfg)
+        metadata["group_id"] = str(group_id)
+        save_config(
+            new_cfg,
+            source="webui",
+            reason="group.delete",
+            actor="authenticated_webui_session",
+            metadata=metadata,
+            submitted_fields=["groups"],
+        )
+        store.update(new_cfg)
+        return aiohttp.web.json_response({"deleted": group_id})
+
+    return handler
+
+
+def _sync_groups(store: ConfigStore, state: dict[str, Any]):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        api = state.get("api")
+        if api is None:
+            return aiohttp.web.json_response({"error": "OneBot API not available"}, status=503)
+        try:
+            info = await api.call("get_group_list")
+            remote_groups = info.get("data", [])
+        except Exception as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=500)
+        cfg = store.config
+        new_groups = dict(cfg.groups)
+        added = []
+        for g in remote_groups:
+            gid = str(g.get("group_id", ""))
+            if not gid or gid in new_groups:
+                continue
+            gc = GroupConfig(group_id=gid, name=g.get("group_name", ""))
+            new_groups[gid] = gc.to_dict()
+            added.append(gid)
+        if added:
+            new_cfg = cfg.with_overrides(groups=new_groups)
+            save_config(
+                new_cfg,
+                source="webui",
+                reason="group.sync",
+                actor="authenticated_webui_session",
+                metadata=_config_request_metadata(request, cfg),
+                submitted_fields=["groups"],
+            )
+            store.update(new_cfg)
+        return aiohttp.web.json_response({"added": added, "total": len(new_groups)})
+
+    return handler
+
+
+# ── Hermes tools management (OneBot platform) ─────────────────────────────
+
+
+def _get_hermes_tools(store: ConfigStore):
+    async def handler(_: aiohttp.web.Request) -> aiohttp.web.Response:
+        from onebot_adapter.hermes_config import (
+            list_available_toolsets,
+            read_current_enabled,
+        )
+
+        cfg = store.config
+        _path, err_resp = _hermes_config_or_error(cfg)
+        if err_resp is not None:
+            return err_resp
+        try:
+            available = await asyncio.to_thread(
+                list_available_toolsets,
+                cfg.hermes_install_dir or None,
+                extra_roots=_hermes_roots(cfg),
+            )
+        except HermesDirNotAllowed as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        if "error" in available:
+            return aiohttp.web.json_response(available, status=500)
+        try:
+            current = await asyncio.to_thread(
+                read_current_enabled,
+                cfg.hermes_install_dir or None,
+                extra_roots=_hermes_roots(cfg),
+            )
+        except Exception as exc:
+            logger.warning("read_current_enabled failed: %s", exc)
+            current = []
+        return aiohttp.web.json_response({
+            "configurable": available.get("configurable", []),
+            "mcp_servers": available.get("mcp_servers", []),
+            "current_enabled": current,
+            "hermes_dir_ok": True,
+        })
+
+    return handler
+
+
+def _put_hermes_tools(store: ConfigStore):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        from onebot_adapter.hermes_config import (
+            NO_MCP_SENTINEL,
+            PLATFORM,
+            PLUGIN_TOOLSET_KEY,
+            list_available_toolsets,
+            write_platform_toolsets,
+        )
+
+        cfg = store.config
+        _path, err_resp = _hermes_config_or_error(cfg)
+        if err_resp is not None:
+            return err_resp
+        try:
+            data = await request.json()
+        except Exception:
+            return aiohttp.web.json_response({"error": "invalid JSON"}, status=400)
+
+        toolsets = data.get("toolsets", []) or []
+        mcp_servers = data.get("mcp_servers", []) or []
+        no_mcp = bool(data.get("no_mcp", False))
+
+        # no_mcp 与 mcp_servers 互斥:no_mcp 表示屏蔽全部 MCP,不应同时启用具体 MCP servers
+        if no_mcp and mcp_servers:
+            return aiohttp.web.json_response(
+                {"error": "no_mcp 与 mcp_servers 互斥,不能同时设置"}, status=400,
+            )
+
+        # 校验:每个 key 必须在 configurable ∪ plugin_keys ∪ mcp_names 中
+        try:
+            available = await asyncio.to_thread(
+                list_available_toolsets,
+                cfg.hermes_install_dir or None,
+                extra_roots=_hermes_roots(cfg),
+            )
+        except HermesDirNotAllowed as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        if "error" in available:
+            return aiohttp.web.json_response(available, status=500)
+        valid_keys: set[str] = set()
+        for item in available.get("configurable", []):
+            valid_keys.add(item["key"])
+        for item in available.get("mcp_servers", []):
+            valid_keys.add(item["name"])
+        valid_keys.add(PLUGIN_TOOLSET_KEY)
+        # NO_MCP_SENTINEL is intentionally NOT in valid_keys — it must only
+        # enter via the no_mcp flag, never as a toolset key.
+
+        invalid = [k for k in (list(toolsets) + list(mcp_servers)) if k not in valid_keys]
+        if invalid:
+            return aiohttp.web.json_response(
+                {"error": f"无效的工具集 key: {invalid}"}, status=400,
+            )
+
+        final = sorted(set(str(k) for k in toolsets) | set(str(k) for k in mcp_servers))
+        if no_mcp:
+            final = sorted(set(final) | {NO_MCP_SENTINEL})
+
+        try:
+            await asyncio.to_thread(
+                write_platform_toolsets,
+                cfg.hermes_install_dir or None,
+                final,
+                extra_roots=_hermes_roots(cfg),
+            )
+        except HermesDirNotAllowed as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        except FileNotFoundError as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.exception("write platform_toolsets failed")
+            return aiohttp.web.json_response({"error": str(exc)}, status=500)
+        audit_logger.info(
+            "Hermes toolsets updated source=webui client_ip=%s toolsets=%s",
+            _client_ip(request, cfg), final,
+        )
+        return aiohttp.web.json_response({"ok": True, "saved": final, "platform": PLATFORM})
+
+    return handler
+
+
+def _reset_hermes_tools(store: ConfigStore):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        from onebot_adapter.hermes_config import reset_platform_toolsets
+
+        cfg = store.config
+        _path, err_resp = _hermes_config_or_error(cfg)
+        if err_resp is not None:
+            return err_resp
+        try:
+            await asyncio.to_thread(
+                reset_platform_toolsets,
+                cfg.hermes_install_dir or None,
+                extra_roots=_hermes_roots(cfg),
+            )
+        except HermesDirNotAllowed as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.exception("reset platform_toolsets failed")
+            return aiohttp.web.json_response({"error": str(exc)}, status=500)
+        audit_logger.warning(
+            "Hermes toolsets reset source=webui client_ip=%s",
+            _client_ip(request, cfg),
+        )
+        return aiohttp.web.json_response({"ok": True})
+
+    return handler
+
+
+# ── Hermes OneBot per-tool policies ──────────────────────────────────────
+
+
+def _onebot_tool_catalog() -> list[dict[str, Any]]:
+    """Build the catalog lazily so plugin tool changes need no route restart."""
+    from onebot_adapter.hermes_plugin import onebot_tools
+
+    catalog: list[dict[str, Any]] = []
+    for entry in onebot_tools._TOOLS:
+        if isinstance(entry, tuple):
+            name, _handler, schema = entry
+            metadata = onebot_tools.tool_metadata(name, schema)
+            item = {
+                "name": name,
+                "schema": schema,
+                **metadata,
+            }
+        else:
+            def _field(key: str, default: Any = None, source: Any = entry) -> Any:
+                if isinstance(source, dict):
+                    return source.get(key, default)
+                return getattr(source, key, default)
+
+            name = _field("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError("OneBot tool spec has an invalid name")
+            default_registered = _field("default_registered", True)
+            default_permission = _field(
+                "default_permission",
+                onebot_tools.default_tool_permission(name),
+            )
+            if not isinstance(default_registered, bool):
+                raise ValueError(f"OneBot tool {name} has an invalid default_registered")
+            if default_permission not in {"everyone", "admin"}:
+                raise ValueError(f"OneBot tool {name} has an invalid default_permission")
+            item = {
+                "name": name,
+                "schema": _field("schema", {}),
+                "default_registered": default_registered,
+                "default_permission": default_permission,
+                "category": _field("category", "general") or "general",
+                "scope": _field("scope"),
+                "packet": _field("packet", False),
+                "caveat": _field("caveat"),
+            }
+        catalog.append(item)
+    return catalog
+
+
+def _tool_policy_response(catalog: list[dict[str, Any]], stored: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    effective: dict[str, dict[str, Any]] = {}
+    sparse: dict[str, dict[str, Any]] = {}
+    for item in catalog:
+        name = item["name"]
+        policy = stored.get(name, {})
+        registered = policy.get("registered", item["default_registered"])
+        permission = policy.get("permission", item["default_permission"])
+        if not isinstance(registered, bool):
+            registered = item["default_registered"]
+        if permission not in {"everyone", "admin"}:
+            permission = item["default_permission"]
+        effective[name] = {"registered": registered, "permission": permission}
+        if registered != item["default_registered"] or permission != item["default_permission"]:
+            sparse[name] = {"registered": registered, "permission": permission}
+    return {
+        "catalog": catalog,
+        "policies": effective,
+        "effective_policies": effective,
+        "sparse_policies": sparse,
+        "restart_required": True,
+    }
+
+
+def _get_onebot_tool_policies(store: ConfigStore):
+    async def handler(_: aiohttp.web.Request) -> aiohttp.web.Response:
+        from onebot_adapter.hermes_config import read_onebot_tool_policies
+
+        cfg = store.config
+        _path, err_resp = _hermes_config_or_error(cfg)
+        if err_resp is not None:
+            return err_resp
+        install_dir = cfg.hermes_install_dir or None
+        try:
+            return aiohttp.web.json_response(
+                _tool_policy_response(
+                    _onebot_tool_catalog(),
+                    await asyncio.to_thread(
+                        read_onebot_tool_policies, install_dir, extra_roots=_hermes_roots(cfg),
+                    ),
+                )
+            )
+        except HermesDirNotAllowed as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.exception("read OneBot tool policies failed")
+            return aiohttp.web.json_response({"error": str(exc)}, status=500)
+
+    return handler
+
+
+def _put_onebot_tool_policies(store: ConfigStore):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        from onebot_adapter.hermes_config import write_onebot_tool_policies
+
+        cfg = store.config
+        _path, err_resp = _hermes_config_or_error(cfg)
+        if err_resp is not None:
+            return err_resp
+        install_dir = cfg.hermes_install_dir or None
+        try:
+            data = await request.json()
+        except Exception:
+            return aiohttp.web.json_response({"error": "invalid JSON"}, status=400)
+        if not isinstance(data, dict):
+            return aiohttp.web.json_response({"error": "policy payload must be an object"}, status=400)
+        if "policies" in data:
+            if set(data) != {"policies"}:
+                return aiohttp.web.json_response({"error": "unknown top-level fields"}, status=400)
+            policies = data["policies"]
+        else:
+            policies = data
+        if not isinstance(policies, dict):
+            return aiohttp.web.json_response({"error": "policies must be an object"}, status=400)
+
+        try:
+            catalog = _onebot_tool_catalog()
+        except Exception as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=500)
+        defaults = {item["name"]: item for item in catalog}
+        sparse: dict[str, dict[str, Any]] = {}
+        for name, policy in policies.items():
+            if name not in defaults:
+                return aiohttp.web.json_response({"error": f"unknown tool: {name}"}, status=400)
+            if not isinstance(policy, dict):
+                return aiohttp.web.json_response({"error": f"policy for {name} must be an object"}, status=400)
+            unknown_fields = set(policy) - {"registered", "permission"}
+            if unknown_fields:
+                return aiohttp.web.json_response(
+                    {"error": f"unknown policy fields for {name}: {sorted(unknown_fields)}"}, status=400
+                )
+            registered = defaults[name]["default_registered"]
+            permission = defaults[name]["default_permission"]
+            if "registered" in policy:
+                if not isinstance(policy["registered"], bool):
+                    return aiohttp.web.json_response(
+                        {"error": f"registered for {name} must be a boolean"}, status=400
+                    )
+                registered = policy["registered"]
+            if "permission" in policy:
+                if not isinstance(policy["permission"], str) or policy["permission"] not in {"everyone", "admin"}:
+                    return aiohttp.web.json_response(
+                        {"error": f"permission for {name} must be everyone or admin"}, status=400
+                    )
+                permission = policy["permission"]
+            if (registered, permission) != (
+                defaults[name]["default_registered"], defaults[name]["default_permission"]
+            ):
+                sparse[name] = {"registered": registered, "permission": permission}
+
+        try:
+            await asyncio.to_thread(
+                write_onebot_tool_policies, install_dir, sparse, extra_roots=_hermes_roots(store.config),
+            )
+        except HermesDirNotAllowed as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.exception("write OneBot tool policies failed")
+            return aiohttp.web.json_response({"error": str(exc)}, status=500)
+        audit_logger.info(
+            "Hermes OneBot tool policies updated source=webui client_ip=%s tools=%d",
+            _client_ip(request, store.config), len(sparse),
+        )
+        return aiohttp.web.json_response(_tool_policy_response(catalog, sparse))
+
+    return handler
+
+
+def _reset_onebot_tool_policies(store: ConfigStore):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        from onebot_adapter.hermes_config import reset_onebot_tool_policies
+
+        cfg = store.config
+        _path, err_resp = _hermes_config_or_error(cfg)
+        if err_resp is not None:
+            return err_resp
+        install_dir = cfg.hermes_install_dir or None
+        try:
+            catalog = _onebot_tool_catalog()
+            await asyncio.to_thread(
+                reset_onebot_tool_policies, install_dir, extra_roots=_hermes_roots(cfg),
+            )
+        except HermesDirNotAllowed as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.exception("reset OneBot tool policies failed")
+            return aiohttp.web.json_response({"error": str(exc)}, status=500)
+        audit_logger.warning(
+            "Hermes OneBot tool policies reset source=webui client_ip=%s",
+            _client_ip(request, store.config),
+        )
+        return aiohttp.web.json_response(_tool_policy_response(catalog, {}))
+
+    return handler
+
+
+# ── Hermes session-isolation mode (group_sessions_per_user) ──────────────
+
+
+def _get_hermes_mode(store: ConfigStore, state: dict[str, Any]):
+    async def handler(_: aiohttp.web.Request) -> aiohttp.web.Response:
+        cfg = store.config
+        # 当前生效值:来自插件上报(relay 缓存);未连接时回退读 Hermes config.yaml
+        relay = state.get("relay")
+        reported = getattr(relay, "hermes_group_sessions_per_user", None) if relay else None
+        if reported is not None:
+            return aiohttp.web.json_response({
+                "group_sessions_per_user": reported,
+                "source": "plugin_report",
+                "plugin_connected": bool(relay and relay.has_clients),
+            })
+        # 插件未上报:回退读 Hermes config.yaml 顶层值
+        from onebot_adapter.hermes_config import read_group_sessions_per_user
+
+        try:
+            file_value = await asyncio.to_thread(
+                read_group_sessions_per_user,
+                cfg.hermes_install_dir or None,
+                extra_roots=_hermes_roots(cfg),
+            )
+        except HermesDirNotAllowed as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            return aiohttp.web.json_response(
+                {"error": f"读取 Hermes config.yaml 失败: {exc}"}, status=500,
+            )
+        # 文件不存在该字段时按 Hermes 默认 True 处理
+        return aiohttp.web.json_response({
+            "group_sessions_per_user": True if file_value is None else file_value,
+            "source": "hermes_config_yaml" if file_value is not None else "default",
+            "plugin_connected": False,
+        })
+
+    return handler
+
+
+def _put_hermes_mode(store: ConfigStore):
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return aiohttp.web.json_response({"error": "invalid JSON"}, status=400)
+        value = data.get("group_sessions_per_user")
+        if not isinstance(value, bool):
+            return aiohttp.web.json_response(
+                {"error": "group_sessions_per_user 必须是布尔值"}, status=400,
+            )
+        cfg = store.config
+        from onebot_adapter.hermes_config import write_group_sessions_per_user
+
+        try:
+            await asyncio.to_thread(
+                write_group_sessions_per_user,
+                cfg.hermes_install_dir or None,
+                value,
+                extra_roots=_hermes_roots(cfg),
+            )
+        except HermesDirNotAllowed as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        except FileNotFoundError as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.exception("write group_sessions_per_user failed")
+            return aiohttp.web.json_response({"error": str(exc)}, status=500)
+        audit_logger.info(
+            "Hermes group_sessions_per_user updated source=webui client_ip=%s value=%s",
+            _client_ip(request, cfg), value,
+        )
+        return aiohttp.web.json_response({
+            "ok": True,
+            "written": value,
+            "restart_required": True,
+            "note": "已写入 Hermes config.yaml,需重启 Hermes 网关生效。重启后请点击'刷新上报值'更新显示。",
+        })
+
+    return handler
+
+
+def _refresh_hermes_mode(state: dict[str, Any]):
+    async def handler(_: aiohttp.web.Request) -> aiohttp.web.Response:
+        relay = state.get("relay")
+        if not relay:
+            return aiohttp.web.json_response({"error": "relay 未就绪"}, status=503)
+        if not relay.has_clients:
+            return aiohttp.web.json_response({
+                "ok": False,
+                "error": "Hermes 插件未连接,无法刷新。请先确保插件已连接。",
+            })
+        try:
+            await relay.broadcast_mode_refresh()
+        except Exception as exc:
+            return aiohttp.web.json_response({"error": str(exc)}, status=500)
+        return aiohttp.web.json_response({"ok": True, "note": "已请求插件重新上报,稍后刷新页面查看"})
+
+    return handler
+
+
+async def _update_check(_: aiohttp.web.Request) -> aiohttp.web.Response:
+    from onebot_adapter.update_check import check_for_updates
+
+    try:
+        result = await check_for_updates()
+    except Exception as exc:
+        logger.exception("update check failed")
+        return aiohttp.web.json_response({"error": str(exc)}, status=500)
+    return aiohttp.web.json_response(result)
+
+
+async def _index(_: aiohttp.web.Request) -> aiohttp.web.Response:
+    index = _STATIC_DIR / "index.html"
+    if index.exists():
+        return aiohttp.web.FileResponse(index)
+    return aiohttp.web.Response(text=_PLACEHOLDER_HTML, content_type="text/html")
+
+
+async def _spa_handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    tail = request.match_info.get("tail", "")
+    clean = tail.lstrip("/")
+    # Resolve real path before checking containment — ``Path.is_relative_to``
+    # only compares string prefixes and does NOT resolve ``..`` segments, so
+    # ``static/../secret.txt`` would pass a raw ``is_relative_to(static)`` check.
+    static_resolved = _STATIC_DIR.resolve()
+    file_path = (static_resolved / clean).resolve()
+    if file_path.is_file() and file_path.is_relative_to(static_resolved):
+        return aiohttp.web.FileResponse(file_path)
+    return await _index(request)
+
+
+_PLACEHOLDER_HTML = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>Hermes OneBot Adapter</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:720px;margin:3rem auto;padding:0 1rem;color:#222}
+h1{font-size:1.4rem}
+code{background:#f4f4f4;padding:.1rem .3rem;border-radius:4px}
+.card{border:1px solid #eee;border-radius:8px;padding:1rem;margin:1rem 0}
+.muted{color:#888;font-size:.85rem}
+</style></head><body>
+<h1>Hermes OneBot Adapter</h1>
+<p class="muted">SPA 尚未构建，API 已就绪。</p>
+<div class="card"><strong>API</strong><ul>
+<li><code>GET /api/v1/health</code></li>
+<li><code>POST /api/v1/auth/login</code></li>
+<li><code>GET /api/v1/status</code></li>
+<li><code>GET /api/v1/config</code> &middot; <code>PATCH /api/v1/config</code></li>
+<li><code>GET /api/v1/openapi.json</code></li>
+</ul></div>
+<div class="card"><strong>WebSocket</strong><ul>
+<li>OneBot 反向WS: <code>ws://&lt;host&gt;:18800/onebot</code></li>
+<li>Hermes 插件: <code>ws://&lt;host&gt;:18810/hermes</code>
+（Authorization Bearer 优先，仍接受 <code>?token=</code>）</li>
+</ul></div>
+</body></html>"""

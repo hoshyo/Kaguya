@@ -1,0 +1,124 @@
+name: onebot-platform
+label: OneBot (NapCat)
+kind: platform
+version: "0.0.0"  # Installer replaces this placeholder with the package version.
+description: >
+  OneBot 11 适配器插件，经独立 onebot_adapter 服务对接 NapCat / go-cqhttp 等
+  OneBot 11 实现。插件通过 WebSocket 与适配器服务通信，不直接接触 NapCat。
+author: Alec
+requires_env:
+  - name: ONEBOT_ADAPTER_URL
+    description: "适配器服务 WebSocket 地址 (ws://host:port/hermes)"
+    prompt: "适配器服务 WS 地址"
+    password: false
+  - name: ONEBOT_ADAPTER_TOKEN
+    description: "适配器服务鉴权 token（WebUI 中显示）"
+    prompt: "适配器服务 token"
+    password: true
+optional_env:
+  - name: ONEBOT_HOME_CHANNEL
+    description: "cron / 通知投递目标 chat_id（私聊为 QQ 号，群为 group:<id>）"
+    prompt: "Home channel"
+    password: false
+provides_tools:
+  - onebot_read_current_group_history
+  - onebot_get_login_info
+  - onebot_get_group_list
+  - onebot_get_group_info
+  - onebot_get_group_member_list
+  - onebot_get_group_member_info
+  - onebot_get_friend_list
+  - onebot_get_user_info
+  - onebot_get_msg
+  - onebot_get_group_msg_history
+  - onebot_get_friend_msg_history
+  - onebot_get_forward_msg
+  - onebot_mark_msg_as_read
+  - onebot_get_file
+  - onebot_get_recent_contact
+  - onebot_send_like
+  - onebot_get_friends_with_category
+  - onebot_get_profile_like
+  - onebot_fetch_custom_face
+  - onebot_get_bot_blacklist
+  - onebot_edit_bot_blacklist
+  - onebot_send_message
+  - onebot_recall_message
+  - onebot_send_forward_msg
+  - onebot_forward_single_msg
+  - onebot_poke
+  - onebot_set_msg_emoji_like
+  - onebot_kick_group_member
+  - onebot_mute_group_member
+  - onebot_mute_group_whole
+  - onebot_set_group_admin
+  - onebot_set_group_card
+  - onebot_set_group_name
+  - onebot_leave_group
+  - onebot_handle_group_request
+  - onebot_handle_friend_request
+  - onebot_delete_friend
+  - onebot_set_group_special_title
+  - onebot_set_online_status
+  - onebot_set_signature
+  - onebot_set_avatar
+  - onebot_upload_file
+  - onebot_get_essence_msg_list
+  - onebot_set_essence_msg
+  - onebot_delete_essence_msg
+  - onebot_get_group_notice
+  - onebot_send_group_notice
+  - onebot_del_group_notice
+  - onebot_set_group_sign
+  - onebot_get_group_signed_list
+  - onebot_get_qun_album_list
+  - onebot_get_group_album_media_list
+  - onebot_upload_image_to_qun_album
+  - onebot_set_group_album_media_like
+  - onebot_cancel_group_album_media_like
+  - onebot_do_group_album_comment
+  - onebot_del_group_album_media
+  - onebot_set_group_todo
+  - onebot_complete_group_todo
+  - onebot_cancel_group_todo
+  - onebot_set_friend_remark
+  - onebot_get_unidirectional_friend_list
+  - onebot_set_qq_profile
+  - onebot_nc_get_user_status
+  - onebot_get_doubt_friends_add_request
+  - onebot_get_group_ignore_add_request
+  - onebot_fetch_custom_face_detail
+  - onebot_add_custom_face
+  - onebot_delete_custom_face
+  - onebot_set_custom_face_desc
+  - onebot_set_group_portrait
+  - onebot_set_group_remark
+  - onebot_get_group_ignored_notifies
+  - onebot_get_group_shut_list
+  - onebot_get_group_info_ex
+  - onebot_get_group_detail_info
+  - onebot_create_collection
+  - onebot_get_collection_list
+  - onebot_fetch_emoji_like
+  - onebot_get_emoji_likes
+  - onebot_get_group_file_system_info
+  - onebot_get_group_root_files
+  - onebot_get_group_files_by_folder
+  - onebot_get_group_file_url
+  - onebot_delete_group_file
+  - onebot_create_group_file_folder
+  - onebot_delete_group_folder
+  - onebot_move_group_file
+  - onebot_rename_group_file
+  - onebot_trans_group_file
+  - onebot_create_flash_task
+  - onebot_send_flash_msg
+  - onebot_get_share_link
+  - onebot_get_fileset_id
+  - onebot_get_fileset_info
+  - onebot_get_flash_file_list
+  - onebot_get_flash_file_url
+  - onebot_download_fileset
+  - onebot_get_group_system_msg
+  - onebot_get_group_honor_info
+  - onebot_set_group_add_option

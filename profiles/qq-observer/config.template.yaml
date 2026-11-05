@@ -1,0 +1,12 @@
+agent:
+  reasoning_effort: low
+  max_turns: 1
+auxiliary:
+  background_review:
+    enabled: false
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+tools:
+  tool_search:
+    enabled: "off"
