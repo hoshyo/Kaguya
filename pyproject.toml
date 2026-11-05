@@ -8,7 +8,8 @@ dynamic = ["version"]
 description = "Portable Kaguya QQ bot profiles and OneBot 11 runtime for Hermes Agent."
 readme = "README.md"
 license = "MIT"
-authors = [{ name = "Alec" }, { name = "Kaguya contributors" }]
+license-files = ["LICENSE", "NOTICE.md", "LICENSES/*.txt"]
+authors = [{ name = "UR" }, { name = "Alec" }, { name = "Kaguya contributors" }]
 requires-python = ">=3.11"
 classifiers = [
     "Development Status :: 5 - Production/Stable",

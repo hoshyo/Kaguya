@@ -38,6 +38,19 @@ downloads/
 test-results/
 .kaguya/
 
+# Hermes runtime conversation state. These can contain complete prompts,
+# previous turns, tool traces, member IDs and compressed context snapshots.
+sessions/
+conversations/
+transcripts/
+context_snapshots/
+*.jsonl
+*.ndjson
+request_dump_*.json
+conversation_dump_*.json
+context_dump_*.json
+context_length_cache.yaml*
+
 # Local migration/configuration tests from the source deployment are not part
 # of the distributable suite. They depend on operator-only scripts and state.
 tests/test_aidog_voice.py

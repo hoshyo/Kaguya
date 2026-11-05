@@ -2,7 +2,7 @@
 
 Kaguya 是一套可复现部署的 QQ 群聊机器人：使用 NapCat 接收 OneBot 11 事件，独立适配器负责准入、会话上下文、历史查询、主动参与判断与消息投递，Hermes Agent 负责推理、人格和记忆。
 
-仓库来自一套实际运行中的机器人，但它是经过脱敏的公开发行版。**不含**真实 QQ 号或群号、现有群绑定、聊天记录、上下文图片、登录态、API Key、访问令牌、数据库、日志，以及针对真实群成员的关系或偏好记忆。
+仓库来自一套实际运行中的机器人，但它是经过脱敏的公开发行版。**不含**真实 QQ 号或群号、现有群绑定、聊天记录、Hermes 上一轮会话上下文/请求转储、上下文图片、登录态、API Key、访问令牌、数据库、日志，以及针对真实群成员的关系或偏好记忆。
 
 ## 包含什么
 
@@ -25,6 +25,8 @@ Hermes 自带技能由锁定版本的 Hermes 安装器提供，仓库不重复�
 - 桌面 QQ/NapCat 所需的系统依赖；无图形界面服务器还需要 `xvfb`
 
 NapCat 和非官方 QQ 自动化可能受 QQ 平台规则、客户端版本与账号风控影响。请只在自己有权管理的账号和群中使用。
+NapCatQQ 本体采用带非商业及再分发限制的独立许可证；本仓库不包含其源码或二进制，
+使用 `--with-napcat` 安装时仍须遵守其[上游许可证](https://github.com/NapNeko/NapCatQQ/blob/main/LICENSE)。
 
 ## 安装
 
@@ -110,7 +112,7 @@ chmod +x ./kaguya
 ./kaguya privacy-check
 ```
 
-隐私扫描会拒绝常见密钥、真实样式的 profile QQ/群标识、数据库、日志、压缩包和媒体文件。更完整的边界见 [PRIVACY.md](PRIVACY.md) 与 [SECURITY.md](SECURITY.md)。
+隐私扫描会拒绝常见密钥、真实样式的 profile QQ/群标识、Hermes 会话/上下文记录、请求转储、JSONL/NDJSON、数据库、日志、压缩包和媒体文件。更完整的边界见 [PRIVACY.md](PRIVACY.md) 与 [SECURITY.md](SECURITY.md)。
 
 ## 开发
 
@@ -121,4 +123,6 @@ chmod +x ./kaguya
 cd frontend && npm ci && npm run build
 ```
 
-适配器详细配置和 API 见 [docs/README.md](docs/README.md)。Python 代码采用 MIT 许可证；依赖项目及 QQ/NapCat/Hermes 各自遵循其许可证和服务条款，详见 [NOTICE.md](NOTICE.md)。
+适配器详细配置和 API 见 [docs/README.md](docs/README.md)。Kaguya 自有代码采用 MIT 许可证，
+版权归 UR；源自 Alec 和 Nous Research 的部分保留其原始 MIT 版权声明。依赖项目及
+QQ/NapCat/Hermes 各自遵循其许可证和服务条款，详见 [NOTICE.md](NOTICE.md) 与 `LICENSES/`。

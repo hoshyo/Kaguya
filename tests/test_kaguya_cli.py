@@ -32,6 +32,17 @@ def test_privacy_check_rejects_media(tmp_path: Path, monkeypatch, capsys):
     assert "forbidden file: context.svg" in capsys.readouterr().out
 
 
+def test_privacy_check_rejects_hermes_session_context(tmp_path: Path, monkeypatch, capsys):
+    session = tmp_path / "profiles" / "aidog" / "sessions" / "request_dump_synthetic.json"
+    session.parent.mkdir(parents=True)
+    session.write_text('{"messages":["synthetic prior turn"]}', encoding="utf-8")
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    assert cli._privacy_check(argparse.Namespace()) == 1
+    output = capsys.readouterr().out
+    assert "runtime conversation/session record" in output
+    assert "request_dump_synthetic.json" in output
+
+
 def test_systemd_argument_quoting():
     assert cli._unit_quote('/tmp/Kaguya Bot/"qq"') == '"/tmp/Kaguya Bot/\\"qq\\""'
 

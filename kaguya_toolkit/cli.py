@@ -594,8 +594,15 @@ def _doctor(_args: argparse.Namespace) -> int:
 
 FORBIDDEN_SUFFIXES = {
     ".db", ".sqlite", ".sqlite3", ".log", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif",
-    ".bmp", ".svg", ".svgz", ".zip", ".7z", ".tar", ".gz",
+    ".bmp", ".svg", ".svgz", ".zip", ".7z", ".tar", ".gz", ".jsonl", ".ndjson",
 }
+RUNTIME_RECORD_DIRS = {
+    "sessions", "conversations", "transcripts", "context_snapshots", "conversation_snapshots",
+}
+RUNTIME_RECORD_NAMES = {
+    "sessions.json", "context_length_cache.yaml", "context_length_cache.yaml.lock",
+}
+RUNTIME_RECORD_PREFIXES = ("request_dump_", "conversation_dump_", "context_dump_")
 SECRET_PATTERNS = {
     "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     "OpenAI-like key": re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),
@@ -618,6 +625,14 @@ def _privacy_check(_args: argparse.Namespace) -> int:
     for path in _tracked_candidates():
         rel = path.relative_to(REPO_ROOT)
         lower = path.name.lower()
+        parts = {part.lower() for part in rel.parts}
+        if (
+            parts & RUNTIME_RECORD_DIRS
+            or lower in RUNTIME_RECORD_NAMES
+            or lower.startswith(RUNTIME_RECORD_PREFIXES)
+        ):
+            problems.append(f"runtime conversation/session record: {rel}")
+            continue
         if lower in {".env", "auth.json", "group_messages.sqlite3"} or path.suffix.lower() in FORBIDDEN_SUFFIXES:
             problems.append(f"forbidden file: {rel}")
             continue
@@ -642,7 +657,10 @@ def _privacy_check(_args: argparse.Namespace) -> int:
         for problem in sorted(set(problems)):
             print(f"- {problem}")
         return 1
-    print("Privacy check passed: no credentials, live IDs, databases, logs, archives, or media detected")
+    print(
+        "Privacy check passed: no credentials, live IDs, session/context records, databases, logs, "
+        "archives, or media detected"
+    )
     return 0
 
 
